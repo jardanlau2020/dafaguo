@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # ============================================================
-# NeoHeberg AFK 一键部署与运行脚本
-# 适用：Debian / Ubuntu（其他发行版需自行确保 python3-venv / xvfb）
-# 用法：
-#   bash <(curl -fsSL https://raw.githubusercontent.com/xxbb678/neoheberg-oneclick/main/install.sh)
-#   或下载后：EMAIL='...' PASSWORD='...' bash install.sh run
+# NeoHeberg AFK 交互式管理脚本
+# 1 安装与添加账号密码
+# 2 配置 Telegram 通知
+# 3 查看运行状态
+# 4 卸载
+# 0 退出
+# 用法：bash <(curl -fsSL https://raw.githubusercontent.com/xxbb678/neoheberg-oneclick/main/install.sh)
 # ============================================================
 set -euo pipefail
 
@@ -14,67 +16,29 @@ VENV="$APP_DIR/venv"
 SCRIPT="$APP_DIR/neoheberg.py"
 LOG="$APP_DIR/neoheberg.log"
 ENV_FILE="$APP_DIR/env"
+PID_FILE="$APP_DIR/neoheberg.pid"
+SERVICE="neoheberg-afk"
 
 GREEN=$'\033[32m'; RED=$'\033[31m'; YELLOW=$'\033[33m'; CYAN=$'\033[36m'; NC=$'\033[0m'
 
-info()  { echo "${GREEN}[*]${NC} $*"; }
-warn()  { echo "${YELLOW}[!]${NC} $*"; }
-err()   { echo "${RED}[x]${NC} $*"; }
+info() { echo "${GREEN}[*]${NC} $*"; }
+warn() { echo "${YELLOW}[!]${NC} $*"; }
+err()  { echo "${RED}[x]${NC} $*"; }
+ok()   { echo "${GREEN}[✓]${NC} $*"; }
 
 need_root() {
     [ "$(id -u)" = "0" ] || { err "请用 root 运行（sudo -i 后重试）"; exit 1; }
 }
 
-install_deps() {
-    info "检查系统与依赖..."
-    if command -v apt-get >/dev/null 2>&1; then
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq || true
-        apt-get install -y -qq python3 python3-venv python3-pip xvfb xauth curl ca-certificates \
-            >/dev/null 2>&1 || {
-            warn "部分包安装失败，尝试单个安装..."
-            for p in python3 python3-venv python3-pip xvfb xauth curl ca-certificates; do
-                apt-get install -y -qq "$p" >/dev/null 2>&1 || warn "安装 $p 失败，请手动检查"
-            done
-        }
-    else
-        err "未检测到 apt-get，仅支持 Debian/Ubuntu。请手动安装: python3-venv xvfb xauth"
-        exit 1
+load_env() {
+    if [ -f "$ENV_FILE" ]; then
+        set -a; . "$ENV_FILE" 2>/dev/null || true; set +a
     fi
-
-    info "创建工作目录 $APP_DIR"
-    mkdir -p "$APP_DIR"
-    chmod 700 "$APP_DIR"
-
-    if [ ! -x "$VENV/bin/python" ]; then
-        info "创建 Python 虚拟环境..."
-        python3 -m venv "$VENV"
-    fi
-
-    info "安装 Python 依赖 curl_cffi / ruyipage（首次较慢）..."
-    "$VENV/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
-    "$VENV/bin/pip" install --quiet curl_cffi ruyipage || { err "依赖安装失败"; exit 1; }
-
-    info "准备 ruyipage Firefox 运行时（约百兆，首次下载）..."
-    if ! ls -d /root/.cache/ruyipage/browsers/firefox-* >/dev/null 2>&1; then
-        "$VENV/bin/python" -m ruyipage install || { err "Firefox 运行时下载失败"; exit 1; }
-    else
-        info "Firefox 运行时已存在，跳过下载"
-    fi
-}
-
-fetch_script() {
-    if [ -f "$APP_DIR/neoheberg.py.local" ]; then
-        cp "$APP_DIR/neoheberg.py.local" "$SCRIPT"
-        info "使用本地脚本"
-        return
-    fi
-    info "下载最新版 neoheberg.py ..."
-    curl -fsSL "$REPO_RAW/neoheberg.py" -o "$SCRIPT" || { err "脚本下载失败"; exit 1; }
+    return 0
 }
 
 write_env_file() {
-    # 将凭证写入 600 权限的 env 文件，避免每次手输
+    mkdir -p "$APP_DIR"
     : > "$ENV_FILE"
     chmod 600 "$ENV_FILE"
     [ -n "${EMAIL:-}" ]        && echo "EMAIL='${EMAIL}'"               >> "$ENV_FILE"
@@ -83,118 +47,310 @@ write_env_file() {
     [ -n "${TG_CHAT_ID:-}" ]   && echo "TG_CHAT_ID='${TG_CHAT_ID}'"     >> "$ENV_FILE"
     [ -n "${PROXY:-}" ]        && echo "PROXY='${PROXY}'"               >> "$ENV_FILE"
     [ -n "${NH_WAIT:-}" ]      && echo "NH_WAIT='${NH_WAIT}'"           >> "$ENV_FILE"
-    info "凭证已保存到 $ENV_FILE（权限 600）"
+    return 0
 }
 
-run_now() {
-    if [ -f "$ENV_FILE" ]; then
-        info "从 $ENV_FILE 加载凭证"
-        # shellcheck disable=SC1090
-        set -a; . "$ENV_FILE"; set +a
-    fi
+# ---------------- 1. 安装与添加账号密码 ----------------
+menu_install() {
+    echo ""
+    echo "${CYAN}=== 安装与添加账号密码 ===${NC}"
+    load_env
 
-    if [ -z "${EMAIL:-}" ] || [ -z "${PASSWORD:-}" ]; then
-        err "缺少 EMAIL / PASSWORD。例：EMAIL='a@b.com' PASSWORD='xxx' bash install.sh run"
-        exit 1
-    fi
+    local def_email="${EMAIL:-}" in_email in_pass
+    printf "NeoHeberg 登录邮箱"
+    [ -n "$def_email" ] && printf " [当前: %s]" "$def_email"
+    printf ": "
+    read -r in_email || in_email=""
+    [ -z "$in_email" ] && in_email="$def_email"
 
-    info "启动挂机（日志：$LOG）"
-    cd "$APP_DIR"
-    nohup xvfb-run -a "$VENV/bin/python" "$SCRIPT" >> "$LOG" 2>&1 &
-    echo $! > "$APP_DIR/neoheberg.pid"
-    info "已后台运行，PID=$(cat "$APP_DIR/neoheberg.pid")"
-    info "查看日志：tail -f $LOG"
-}
-
-stop_now() {
-    if [ -f "$APP_DIR/neoheberg.pid" ]; then
-        PID=$(cat "$APP_DIR/neoheberg.pid")
-        kill "$PID" 2>/dev/null && info "已停止 PID=$PID" || warn "PID=$PID 不存在或已退出"
-        rm -f "$APP_DIR/neoheberg.pid"
-    fi
-    pkill -f "$SCRIPT" 2>/dev/null || true
-    info "清理完成"
-}
-
-status_now() {
-    if pgrep -f "$SCRIPT" >/dev/null 2>&1; then
-        info "运行中 (PID: $(pgrep -f "$SCRIPT" | tr '\n' ' '))"
+    if [ -n "${PASSWORD:-}" ]; then
+        printf "登录密码 [直接回车沿用已保存的]: "
     else
-        warn "未运行"
+        printf "登录密码: "
     fi
-    [ -f "$LOG" ] && { echo "--- 最近日志 ---"; tail -n 8 "$LOG"; }
-}
+    read -r in_pass || in_pass=""
+    [ -z "$in_pass" ] && in_pass="${PASSWORD:-}"
 
-install_service() {
-    info "安装 systemd 守护服务 neoheberg-afk..."
-    cat > /etc/systemd/system/neoheberg-afk.service <<EOF
-[Unit]
-Description=NeoHeberg AFK Bot
-After=network-online.target
-Wants=network-online.target
+    if [ -z "$in_email" ] || [ -z "$in_pass" ]; then
+        err "邮箱与密码不能为空"
+        return 1
+    fi
+    EMAIL="$in_email"; PASSWORD="$in_pass"
+    write_env_file
+    ok "账号密码已保存到 $ENV_FILE"
 
-[Service]
-Type=simple
-WorkingDirectory=$APP_DIR
-EnvironmentFile=$ENV_FILE
-ExecStart=/usr/bin/xvfb-run -a $VENV/bin/python $SCRIPT
-Restart=on-failure
-RestartSec=30
+    if [ -x "$VENV/bin/python" ] && [ -f "$SCRIPT" ]; then
+        ok "依赖与主脚本已存在，跳过安装"
+    else
+        do_install_deps || return 1
+    fi
 
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable neoheberg-afk >/dev/null 2>&1 || true
-    info "服务已安装。常用："
-    echo "    systemctl start neoheberg-afk     # 启动"
-    echo "    systemctl stop neoheberg-afk      # 停止"
-    echo "    systemctl status neoheberg-afk    # 状态"
-    echo "    journalctl -u neoheberg-afk -f    # 日志"
-}
-
-usage() {
-    cat <<EOF
-NeoHeberg AFK 一键脚本
-
-用法：$0 [命令]
-
-  install    安装依赖与浏览器运行时（默认）
-  run        后台启动挂机（需凭证）
-  stop       停止挂机
-  status     查看状态与日志
-  service    安装 systemd 守护（开机自启）
-
-环境变量（run 时传入，或写入 $ENV_FILE）：
-  EMAIL         必填，NeoHeberg 登录邮箱
-  PASSWORD      必填，登录密码
-  TG_BOT_TOKEN  可选，Telegram 机器人 Token
-  TG_CHAT_ID    可选，Telegram chat id
-  PROXY         可选，如 socks5://user:pass@host:port
-  NH_WAIT       可选，每轮间隔秒（默认 65）
-EOF
-}
-
-main() {
-    need_root
-    case "${1:-install}" in
-        install)
-            install_deps
-            fetch_script
-            [ -n "${EMAIL:-}" ] && write_env_file || true
-            info "安装完成。下一步："
-            echo "    EMAIL='你的邮箱' PASSWORD='密码' bash $0 run"
-            ;;
-        run)
-            [ -x "$VENV/bin/python" ] || { warn "尚未安装，先执行安装..."; install_deps; fetch_script; }
-            write_env_file
-            run_now
-            ;;
-        stop)    stop_now ;;
-        status)  status_now ;;
-        service) install_service ;;
-        *)       usage ;;
+    printf "是否立即启动挂机？[y/N]: "
+    local ans
+    read -r ans || ans=""
+    case "$ans" in
+        y|Y|yes|YES) start_bot ;;
+        *) info "已保存，可选菜单 [3] 随时启动" ;;
     esac
 }
 
-main "$@"
+do_install_deps() {
+    if command -v apt-get >/dev/null 2>&1; then
+        info "正在安装系统依赖（首次较慢）..."
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq || true
+        apt-get install -y -qq python3 python3-venv python3-pip xvfb xauth curl ca-certificates >/dev/null 2>&1 || true
+    else
+        err "未检测到 apt-get，仅支持 Debian/Ubuntu"
+        return 1
+    fi
+
+    mkdir -p "$APP_DIR"; chmod 700 "$APP_DIR"
+    [ -d "$VENV" ] || { info "创建虚拟环境..."; rm -rf "$VENV"; python3 -m venv "$VENV"; }
+
+    info "安装 curl_cffi / ruyipage ..."
+    "$VENV/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
+    "$VENV/bin/pip" install --quiet curl_cffi ruyipage || { err "依赖安装失败"; return 1; }
+
+    if ! ls -d /root/.cache/ruyipage/browsers/firefox-* >/dev/null 2>&1; then
+        info "下载 Firefox 运行时（约百兆）..."
+        "$VENV/bin/python" -m ruyipage install || { err "Firefox 运行时下载失败"; return 1; }
+    else
+        ok "Firefox 运行时已存在"
+    fi
+
+    info "下载主脚本..."
+    if [ -f "$APP_DIR/neoheberg.py.local" ]; then
+        cp "$APP_DIR/neoheberg.py.local" "$SCRIPT"
+    else
+        curl -fsSL "$REPO_RAW/neoheberg.py" -o "$SCRIPT" || { err "脚本下载失败"; return 1; }
+    fi
+    ok "安装完成"
+}
+
+# ---------------- 启停 ----------------
+start_bot() {
+    if pgrep -f "$SCRIPT" >/dev/null 2>&1; then
+        warn "已在运行中，无需重复启动"
+        return 0
+    fi
+    load_env
+    if [ -z "${EMAIL:-}" ] || [ -z "${PASSWORD:-}" ]; then
+        err "未配置账号密码，请先选菜单 [1]"
+        return 1
+    fi
+    if [ ! -x "$VENV/bin/python" ] || [ ! -f "$SCRIPT" ]; then
+        err "尚未安装，请先选菜单 [1]"
+        return 1
+    fi
+    cd "$APP_DIR"
+    nohup xvfb-run -a "$VENV/bin/python" "$SCRIPT" >> "$LOG" 2>&1 &
+    echo $! > "$PID_FILE"
+    sleep 3
+    if pgrep -f "$SCRIPT" >/dev/null 2>&1; then
+        ok "已后台启动（PID $(cat "$PID_FILE" 2>/dev/null)）"
+    else
+        err "启动失败，请看日志: tail -20 $LOG"
+    fi
+}
+
+stop_bot() {
+    if [ -f "$PID_FILE" ]; then
+        kill "$(cat "$PID_FILE")" 2>/dev/null || true
+        rm -f "$PID_FILE"
+    fi
+    pkill -f "$SCRIPT" 2>/dev/null || true
+    ok "已停止"
+}
+
+# ---------------- 2. 配置 Telegram 通知 ----------------
+menu_tg() {
+    echo ""
+    echo "${CYAN}=== 配置 Telegram 通知 ===${NC}"
+    load_env
+
+    printf "Bot Token"
+    if [ -n "${TG_BOT_TOKEN:-}" ]; then
+        printf " [当前: %s...%s]" "$(echo "$TG_BOT_TOKEN" | cut -c1-10)" "$(echo "$TG_BOT_TOKEN" | rev | cut -c1-4 | rev)"
+    fi
+    printf ": "
+    local in_token in_chat
+    read -r in_token || in_token=""
+    [ -z "$in_token" ] && in_token="${TG_BOT_TOKEN:-}"
+
+    printf "Chat ID"
+    [ -n "${TG_CHAT_ID:-}" ] && printf " [当前: %s]" "$TG_CHAT_ID"
+    printf ": "
+    read -r in_chat || in_chat=""
+    [ -z "$in_chat" ] && in_chat="${TG_CHAT_ID:-}"
+
+    TG_BOT_TOKEN="$in_token"; TG_CHAT_ID="$in_chat"
+    write_env_file
+
+    if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+        info "正在发送测试消息..."
+        if curl -fsS -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" \
+            -d text="✅ NeoHeberg 通知已配置成功" >/dev/null 2>&1; then
+            ok "测试消息已发送，请查看 Telegram"
+        else
+            err "发送失败，请检查 Token 与 Chat ID"
+        fi
+    else
+        warn "未填写完整，已清空 TG 配置"
+    fi
+
+    if pgrep -f "$SCRIPT" >/dev/null 2>&1; then
+        printf "通知修改需重启才生效，是否立即重启？[y/N]: "
+        local rr
+        read -r rr || rr=""
+        case "$rr" in
+            y|Y|yes|YES) stop_bot; start_bot ;;
+            *) info "请手动重启使其生效" ;;
+        esac
+    fi
+}
+
+# ---------------- 3. 查看运行状态 ----------------
+menu_status() {
+    echo ""
+    echo "${CYAN}=== 运行状态 ===${NC}"
+
+    if [ ! -d "$APP_DIR" ]; then
+        warn "未安装（$APP_DIR 不存在）"
+        return 0
+    fi
+
+    load_env
+    if pgrep -f "$SCRIPT" >/dev/null 2>&1; then
+        ok "进程：运行中 (PID: $(pgrep -f "$SCRIPT" | tr '\n' ' '))"
+    else
+        warn "进程：未运行"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 && [ -f "/etc/systemd/system/${SERVICE}.service" ]; then
+        echo "    systemd: $(systemctl is-active "$SERVICE" 2>/dev/null || echo unknown) / $(systemctl is-enabled "$SERVICE" 2>/dev/null || echo unknown)"
+    fi
+
+    echo "    账号：${EMAIL:-<未配置>}"
+    if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_CHAT_ID:-}" ]; then
+        echo "    TG 通知：已配置 (chat ${TG_CHAT_ID})"
+    else
+        echo "    TG 通知：未配置"
+    fi
+
+    if [ -f "$LOG" ]; then
+        local rounds bal bj
+        rounds=$(grep -c '轮完成' "$LOG" 2>/dev/null || echo 0)
+        bal=$(grep -E 'TG 报告: 余额=' "$LOG" 2>/dev/null | tail -1 | sed 's/.*余额=//' | awk '{print $1}' || echo "-")
+        [ -z "$bal" ] && bal="-"
+        echo "────────────────────────────"
+        echo "    今日轮次：$rounds"
+        echo "    最新余额：$bal"
+        echo "    最近日志（北京时间）："
+        tail -n 6 "$LOG" | sed 's/^/      /'
+    fi
+
+    echo ""
+    echo "${CYAN}--- 操作 ---${NC}"
+    echo "  [s] 启动 / [k] 停止 / [r] 重启 / [l] 实时日志 / 回车返回"
+    local op
+    read -r op || op=""
+    case "$op" in
+        s|S) start_bot ;;
+        k|K) stop_bot ;;
+        r|R) stop_bot; start_bot ;;
+        l|L) tail -f "$LOG" ;;
+        *) : ;;
+    esac
+}
+
+# ---------------- 4. 卸载 ----------------
+menu_uninstall() {
+    echo ""
+    echo "${CYAN}=== 卸载 ===${NC}"
+    printf "确定卸载 NeoHeberg AFK 吗？进程、凭证、依赖都将删除 [y/N]: "
+    local c
+    read -r c || c=""
+    case "$c" in
+        y|Y|yes|YES) ;;
+        *) info "已取消"; return 0 ;;
+    esac
+
+    stop_bot >/dev/null 2>&1 || true
+
+    if command -v systemctl >/dev/null 2>&1 && [ -f "/etc/systemd/system/${SERVICE}.service" ]; then
+        systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+        systemctl disable "$SERVICE" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/${SERVICE}.service"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        ok "systemd 服务已移除"
+    fi
+
+    rm -rf "$APP_DIR"
+    ok "已删除 $APP_DIR（含 venv、凭证、日志）"
+    info "Firefox 运行时保留在 /root/.cache/ruyipage，如需彻底清理：rm -rf /root/.cache/ruyipage"
+}
+
+# ---------------- 菜单 ----------------
+menu() {
+    while true; do
+        local st
+        if pgrep -f "${SCRIPT}" >/dev/null 2>&1; then
+            st="${GREEN}运行中${NC}"
+        elif [ -d "$APP_DIR" ]; then
+            st="${YELLOW}已安装未运行${NC}"
+        else
+            st="${RED}未安装${NC}"
+        fi
+
+        clear 2>/dev/null || printf '\033[2J\033[H'
+        echo -e "${GREEN}===============================================${NC}"
+        echo -e " NeoHeberg AFK 管理脚本"
+        echo -e " 服务状态: $st"
+        echo -e "${GREEN}===============================================${NC}"
+        echo -e " ${CYAN}[1]${NC} 安装与添加账号密码"
+        echo -e " ${CYAN}[2]${NC} 配置 Telegram 通知"
+        echo -e " ${CYAN}[3]${NC} 查看运行状态"
+        echo -e " ${CYAN}[4]${NC} 卸载"
+        echo -e " ${CYAN}[0]${NC} 退出脚本"
+        echo -e "${GREEN}===============================================${NC}"
+        printf "请输入数字选择 [0-4]: "
+        local choice
+        read -r choice || choice="0"
+
+        case "$choice" in
+            1) menu_install ;;
+            2) menu_tg ;;
+            3) menu_status ;;
+            4) menu_uninstall ;;
+            0) echo "已退出"; exit 0 ;;
+            *) err "无效选择"; sleep 1 ;;
+        esac
+
+        echo ""
+        printf "按回车返回主菜单..."
+        read -r _pause || true
+    done
+}
+
+# ---------------- 入口（支持命令模式与交互模式） ----------------
+need_root
+case "${1:-}" in
+    install)   menu_install ;;
+    tg)        menu_tg ;;
+    status)    menu_status ;;
+    uninstall|remove|del) menu_uninstall ;;
+    *)
+        if [ -t 0 ]; then
+            menu
+        elif [ -r /dev/tty ]; then
+            # 管道方式（curl ... | bash）：交互从 /dev/tty 读取
+            exec < /dev/tty
+            menu
+        else
+            echo "非交互环境。可用: $0 [install|tg|status|uninstall]"
+            exit 1
+        fi
+        ;;
+esac
