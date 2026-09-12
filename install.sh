@@ -79,9 +79,18 @@ fix_legacy_apt_sources() {
     # 关闭 Valid-Until 校验（归档源签名时间很旧）
     echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99neoheberg-no-valid-until
 
-    # bullseye-backports 等兄弟源也一并清理（已不存在于归档站）
+    # 子目录里的旧源（backports、security 等）一并处理：已不存在于归档站，保留只会让 apt update 报错
     if [ -d /etc/apt/sources.list.d ]; then
-        sed -i "/backports/d" /etc/apt/sources.list.d/*.list 2>/dev/null || true
+        local _f
+        for _f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            [ -f "$_f" ] || continue
+            # 将子文件里的官方域名也改为归档站，并删除 backports/security 行
+            sed -i                 -e "s|https\?://deb\.debian\.org/debian|http://archive.debian.org/debian|g"                 -e "s|https\?://security\.debian\.org/debian-security|http://archive.debian.org/debian-security|g"                 -e "/backports/d"                 -e "/debian-security/d"                 "$_f" 2>/dev/null || true
+            # 内容空了就删掉整个文件
+            if ! grep -qE "^[[:space:]]*deb" "$_f" 2>/dev/null; then
+                rm -f "$_f"
+            fi
+        done
     fi
     return 0
 }
@@ -92,7 +101,12 @@ do_install_system_pkgs() {
 
     export DEBIAN_FRONTEND=noninteractive
     fix_legacy_apt_sources
-    apt-get update -qq || true
+
+    # 归档源域名在老系统上可能走 IPv6，确保 apt 不因网络报错而卡死
+    apt-get update -qq 2>/tmp/neoheberg-apt-update.log || true
+    if [ -s /tmp/neoheberg-apt-update.log ]; then
+        warn "apt update 有警告（可能是无效源），详见 /tmp/neoheberg-apt-update.log"
+    fi
 
     info "安装基础软件包..."
     apt-get install -y -qq python3 python3-pip curl ca-certificates xauth >/dev/null 2>&1 || true
@@ -116,9 +130,19 @@ do_install_system_pkgs() {
             >/dev/null 2>&1 || true
     fi
 
-    # 校验关键依赖
-    command -v xvfb-run >/dev/null 2>&1 || warn "xvfb-run 未安装成功，可能影响浏览器启动"
-    ldconfig -p 2>/dev/null | grep -q "libgtk-3\.so\.0" || warn "libgtk-3 未找到，Firefox 可能无法启动"
+    # 校验关键依赖：缺失则重试一次，仍缺则报错并给出排查提示
+    if ! command -v xvfb-run >/dev/null 2>&1; then
+        warn "xvfb-run 缺失，重试安装..."
+        apt-get update -qq 2>/dev/null || true
+        apt-get install -y -qq xvfb >/dev/null 2>&1 || true
+    fi
+    if ! ldconfig -p 2>/dev/null | grep -q "libgtk-3\.so\.0"; then
+        warn "libgtk-3 缺失，重试安装..."
+        do_install_firefox_libs >/dev/null 2>&1 || true
+    fi
+
+    command -v xvfb-run >/dev/null 2>&1 || { err "xvfb-run 安装失败（apt 源可能仍不可用）"; err "请检查: cat /etc/apt/sources.list ; apt-get update"; return 1; }
+    ldconfig -p 2>/dev/null | grep -q "libgtk-3\.so\.0" || { err "libgtk-3 安装失败，Firefox 无法启动"; err "请检查 apt 源是否可用"; return 1; }
     return 0
 }
 
