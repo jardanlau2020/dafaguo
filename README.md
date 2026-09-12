@@ -12,7 +12,7 @@
 
 ## 一键安装
 
-    bash <(curl -fsSL https://raw.githubusercontent.com/xxbb678/neoheberg-oneclick/main/install.sh)
+    bash <(curl -fsSL https://raw.githubusercontent.com/xxbb678/dafaguo/main/install.sh)
 
 安装过程会自动装好 python3-venv、xvfb、xauth，创建虚拟环境，安装 curl_cffi 与 ruyipage，并下载 Firefox 运行时（约百兆，首次较慢）。
 
@@ -21,7 +21,7 @@
 安装完成后，用环境变量传入凭证并后台启动：
 
     EMAIL='你的邮箱' PASSWORD='你的密码' TG_BOT_TOKEN='机器人token' TG_CHAT_ID='chatid' \
-      bash <(curl -fsSL https://raw.githubusercontent.com/xxbb678/neoheberg-oneclick/main/install.sh) run
+      bash <(curl -fsSL https://raw.githubusercontent.com/xxbb678/dafaguo/main/install.sh) run
 
 凭证会写入 `/opt/neoheberg-afk/env`（权限 600），下次启动只需 `bash install.sh run`，无需重输。
 
@@ -40,7 +40,7 @@
 
 更新主脚本（在已安装的机器上）：
 
-    bash <(curl -fsSL https://raw.githubusercontent.com/xxbb678/neoheberg-oneclick/main/install.sh) update
+    bash <(curl -fsSL https://raw.githubusercontent.com/xxbb678/dafaguo/main/install.sh) update
 
 ## 环境变量
 

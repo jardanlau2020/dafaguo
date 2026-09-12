@@ -9,11 +9,11 @@
 # 6 运行状态
 # 7 卸载
 # 0 退出
-# 用法：bash <(curl -fsSL https://raw.githubusercontent.com/xxbb678/neoheberg-oneclick/main/install.sh)
+# 用法：bash <(curl -fsSL https://raw.githubusercontent.com/xxbb678/dafaguo/main/install.sh)
 # ============================================================
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/xxbb678/neoheberg-oneclick/main"
+REPO_RAW="https://raw.githubusercontent.com/xxbb678/dafaguo/main"
 APP_DIR="${NEOHEBERG_DIR:-/opt/neoheberg-afk}"
 VENV="$APP_DIR/venv"
 SCRIPT="$APP_DIR/neoheberg.py"
