@@ -28,10 +28,19 @@
 ## 命令
 
     install   安装依赖与浏览器运行时（默认）
-    run       后台启动挂机（需凭证）
-    stop      停止挂机
-    status    查看状态与最近日志
-    service   安装 systemd 守护（开机自启）
+    account   填写账号密码
+    tg        配置 Telegram 通知（含节点名称）
+    balance   实时查余额（5 秒刷新）
+    status    查看运行状态与最近日志
+    schedule  每日定时挂机
+    update    更新主脚本到最新版（不动依赖）
+    uninstall 卸载（进程、凭证、依赖全删）
+
+交互式菜单：直接运行脚本，或管道方式 `bash <(curl -fsSL <install.sh>)`
+
+更新主脚本（在已安装的机器上）：
+
+    bash <(curl -fsSL https://raw.githubusercontent.com/xxbb678/neoheberg-oneclick/main/install.sh) update
 
 ## 环境变量
 

@@ -987,6 +987,80 @@ menu_uninstall() {
     info "Firefox 运行时保留在 /root/.cache/ruyipage，如需彻底清理：rm -rf /root/.cache/ruyipage"
 }
 
+# ---------------- 更新主脚本（不动依赖） ----------------
+menu_update() {
+    echo ""
+    echo "${CYAN}=== 更新主脚本 ===${NC}"
+
+    if [ ! -d "$APP_DIR" ]; then
+        err "尚未安装，请先选菜单 [1]"
+        return 1
+    fi
+
+    local old_ver new_ver tmp="$APP_DIR/neoheberg.py.new"
+
+    # 记录旧版本特征（方便对比是否变化）
+    if [ -f "$SCRIPT" ]; then
+        old_ver=$(md5sum "$SCRIPT" 2>/dev/null | awk '{print $1}')
+    fi
+
+    info "下载最新主脚本..."
+    if ! curl -fsSL "$REPO_RAW/neoheberg.py" -o "$tmp"; then
+        err "下载失败（检查网络）"
+        return 1
+    fi
+
+    # 老 Python 注解适配 + 语法自检（失败就不替换，避免把坏脚本换上去）
+    adapt_script_for_old_python_check "$tmp"
+    if ! "$VENV/bin/python" -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$tmp" >/dev/null 2>&1; then
+        err "新脚本语法自检失败，已保留旧版本"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    new_ver=$(md5sum "$tmp" 2>/dev/null | awk '{print $1}')
+    if [ -n "$old_ver" ] && [ "$old_ver" = "$new_ver" ]; then
+        ok "已是最新版本，无需更新"
+        rm -f "$tmp"
+        return 0
+    fi
+
+    # 备份旧版本后替换
+    cp -f "$SCRIPT" "$SCRIPT.bak.$(date +%s)" 2>/dev/null || true
+    mv -f "$tmp" "$SCRIPT"
+    adapt_script_for_old_python || true
+    ok "主脚本已更新"
+
+    # 若在运行中，询问是否重启
+    if pgrep -f "$SCRIPT" >/dev/null 2>&1; then
+        printf "脚本已更新，是否立即重启？[y/N]: "
+        local rr
+        read -r rr || rr=""
+        case "$rr" in
+            y|Y|yes|YES) stop_bot; start_bot ;;
+            *) info "请选菜单 [6] 重启使其生效" ;;
+        esac
+    fi
+    return 0
+}
+
+# 对任意路径的脚本做旧 Python 注解适配（不改全局 $SCRIPT）
+adapt_script_for_old_python_check() {
+    local f="$1"
+    [ -f "$f" ] || return 0
+    local pybin pyver
+    if [ -x "$VENV/bin/python" ]; then pybin="$VENV/bin/python"; else pybin="python3"; fi
+    pyver=$("$pybin" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "3.9")
+    case "$pyver" in
+        3.9|3.8|3.7|3.6)
+            if grep -qE -- '->[[:space:]]*[A-Za-z_][A-Za-z0-9_.[], ]*[[:space:]]*[|][[:space:]]*[A-Za-z_]' "$f" 2>/dev/null; then
+                sed -i -E 's/->[[:space:]]*([A-Za-z_][A-Za-z0-9_.[], ]*)[[:space:]]*[|][[:space:]]*([A-Za-z_][A-Za-z0-9_.[], ]*)/-> object/g' "$f"
+            fi
+            ;;
+    esac
+    return 0
+}
+
 # ---------------- 菜单 ----------------
 menu() {
     while true; do
@@ -1011,10 +1085,11 @@ menu() {
         echo -e " ${CYAN}[4]${NC} 查余额"
         echo -e " ${CYAN}[5]${NC} 每日定时挂机"
         echo -e " ${CYAN}[6]${NC} 运行状态"
-        echo -e " ${CYAN}[7]${NC} 卸载"
+        echo -e " ${CYAN}[7]${NC} 更新主脚本"
+        echo -e " ${CYAN}[8]${NC} 卸载"
         echo -e " ${CYAN}[0]${NC} 退出脚本"
         echo -e "${GREEN}===============================================${NC}"
-        printf "请输入数字选择 [0-7]: "
+        printf "请输入数字选择 [0-8]: "
         local choice
         read -r choice || choice="0"
 
@@ -1025,7 +1100,8 @@ menu() {
             4) menu_balance ;;
             5) menu_schedule ;;
             6) menu_status ;;
-            7) menu_uninstall ;;
+            7) menu_update ;;
+            8) menu_uninstall ;;
             0) echo "已退出"; exit 0 ;;
             *) err "无效选择"; sleep 1 ;;
         esac
@@ -1045,6 +1121,7 @@ case "${1:-}" in
     balance)   menu_balance ;;
     status)    menu_status ;;
     schedule)  menu_schedule ;;
+    update|up) menu_update ;;
     uninstall|remove|del) menu_uninstall ;;
     *)
         if [ -t 0 ]; then
@@ -1054,7 +1131,7 @@ case "${1:-}" in
             exec < /dev/tty
             menu
         else
-            echo "非交互环境。可用: $0 [install|tg|status|uninstall]"
+            echo "非交互环境。可用: $0 [install|account|tg|balance|status|schedule|update|uninstall]"
             exit 1
         fi
         ;;
