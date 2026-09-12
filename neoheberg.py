@@ -84,7 +84,7 @@ def load_state() -> dict:
         with open(STATE_FILE) as f:
             return json.load(f)
     except Exception:
-        return {"start_balance": None, "total": 0.0, "rounds": 0, "day_rounds": 0, "last_report": 0, "saved_cookies": {}}
+        return {"start_balance": None, "total": 0.0, "rounds": 0, "day_rounds": 0, "last_report": 0, "last_balance": None, "zero_gain_streak": 0, "saved_cookies": {}}
 
 def save_state(state: dict) -> None:
     try:
@@ -378,6 +378,7 @@ def main() -> None:
         if not state.get("saved_cookies"): raise PermissionError("首次运行无缓存")
         bal = _get_balance(s)
         if state.get("start_balance") is None: state["start_balance"] = bal
+        state["last_balance"] = bal  # 为兑换真实性校验建立基准值
         log.info("启动成功，缓存 Cookie 有效，当前余额: %s", bal)
         report(state, bal, force=True)
         ok = True
@@ -392,6 +393,7 @@ def main() -> None:
                 s = make_session(state)
                 bal = _get_balance(s)
                 if state.get("start_balance") is None: state["start_balance"] = bal
+                state["last_balance"] = bal
                 log.info("启动成功(重试)，当前余额: %s", bal)
                 report(state, bal, force=True)
                 ok = True
@@ -409,6 +411,7 @@ def main() -> None:
         try:
             bal = _get_balance(s)
             if state.get("start_balance") is None: state["start_balance"] = bal
+            state["last_balance"] = bal
             log.info("✅ 新 Cookie 验证通过！当前余额: %s", bal)
             report(state, bal, force=True)
         except PermissionError:
@@ -459,10 +462,35 @@ def main() -> None:
             st = redeem(s, cb)
                 
             time.sleep(SETTLE_SECONDS)
-            state["rounds"] += 1
-            state["day_rounds"] = state.get("day_rounds", 0) + 1
-            consecutive_fail = 0
-            log.info("第 %d 轮完成 (今日第 %d 轮, 余额更新较慢, 后台无感累加中)", state["rounds"], state["day_rounds"])
+
+            # 真实性校验：redeem 返回 200 不代表金币到账。
+            # 只有余额真的增长才算一轮成功，避免虚增轮次造成"在跑但不涨"的假象。
+            prev = state.get("last_balance")
+            new_bal = None
+            try:
+                new_bal = _get_balance(s)
+            except Exception:
+                pass
+
+            if new_bal is not None and prev is not None and new_bal > prev:
+                state["rounds"] += 1
+                state["day_rounds"] = state.get("day_rounds", 0) + 1
+                state["zero_gain_streak"] = 0
+                consecutive_fail = 0
+                state["last_balance"] = new_bal
+                log.info("第 %d 轮完成 (今日第 %d 轮, 余额 %.4f, 本轮 +%.4f)",
+                         state["rounds"], state["day_rounds"], new_bal, new_bal - prev)
+            else:
+                zs = state.get("zero_gain_streak", 0) + 1
+                state["zero_gain_streak"] = zs
+                if new_bal is not None:
+                    state["last_balance"] = new_bal
+                cur = new_bal if new_bal is not None else prev
+                log.warning("第 %d 次兑换未入账（HTTP 200 但余额未增，当前 %.4f），累计 %d 次",
+                            state.get("rounds", 0), (cur if cur is not None else 0.0), zs)
+                if zs in (10, 30, 60):
+                    send_tg(f"⚠️ NeoHeberg 已连续 {zs} 次兑换未入账\n💰 当前余额：{(cur if cur is not None else 0.0):.4f} 🪙\n（广告结算链路可能异常，非脚本故障）")
+                time.sleep(RETRY_COOLDOWN)
 
         except PermissionError:
             s = run_browser_extractor(state)
