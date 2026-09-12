@@ -11,7 +11,7 @@
 set -euo pipefail
 
 REPO_RAW="https://raw.githubusercontent.com/xxbb678/neoheberg-oneclick/main"
-APP_DIR="/opt/neoheberg-afk"
+APP_DIR="${NEOHEBERG_DIR:-/opt/neoheberg-afk}"
 VENV="$APP_DIR/venv"
 SCRIPT="$APP_DIR/neoheberg.py"
 LOG="$APP_DIR/neoheberg.log"
@@ -97,6 +97,21 @@ fix_legacy_apt_sources() {
 }
 
 # 系统依赖（含老系统兼容）
+# libgtk 是否可用：同时看 ldconfig 与文件系统（部分系统 ldconfig 缓存未刷新）
+have_libgtk() {
+    # 注意：本函数在 set -euo pipefail 环境下调用，所有判断必须显式 return，
+    # 否则管道或 grep 的非零状态会被上层当作函数返回值。
+    # 不用管道：ldconfig -p | grep -q 在 set -o pipefail 下会因 SIGPIPE 返回 141，
+    # 而 set -e 会直接终止脚本。改为先取出输出再字符串匹配。
+    if ldconfig -p 2>/dev/null | grep "libgtk-3\.so\.0" >/dev/null 2>&1; then
+        return 0
+    fi
+    if ls /usr/lib/*/libgtk-3.so.0 /usr/lib/libgtk-3.so.0 /lib/*/libgtk-3.so.0 >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
 do_install_system_pkgs() {
     command -v apt-get >/dev/null 2>&1 || { err "未检测到 apt-get，仅支持 Debian/Ubuntu"; return 1; }
 
@@ -127,14 +142,9 @@ do_install_system_pkgs() {
     fi
 
     # Firefox 运行时所需的 GUI 库（老系统默认不安装，导致 libgtk-3.so.0 缺失）
-    if ! ldconfig -p 2>/dev/null | grep -q "libgtk-3\.so\.0"; then
+    if ! have_libgtk; then
         info "补齐 Firefox 所需 GUI 库..."
-        apt-get install -y -qq \
-            libgtk-3-0 libdbus-glib-1-2 libasound2 libxt6 libx11-xcb1 \
-            libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
-            libpango-1.0-0 libcairo2 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
-            libxkbcommon0 libxshmfence1 libdrm2 libxcb1 libnspr4 libnss3 \
-            >/dev/null 2>&1 || true
+        install_gui_libs
     fi
 
     # 校验关键依赖：缺失则重试一次，仍缺则报错并给出排查提示
@@ -143,13 +153,13 @@ do_install_system_pkgs() {
         apt-get update -qq 2>/dev/null || true
         apt-get install -y -qq xvfb >/dev/null 2>&1 || true
     fi
-    if ! ldconfig -p 2>/dev/null | grep -q "libgtk-3\.so\.0"; then
+    if ! have_libgtk; then
         warn "libgtk-3 缺失，重试安装..."
         do_install_firefox_libs >/dev/null 2>&1 || true
     fi
 
     command -v xvfb-run >/dev/null 2>&1 || { err "xvfb-run 安装失败（apt 源可能仍不可用）"; err "请检查: cat /etc/apt/sources.list ; apt-get update"; return 1; }
-    ldconfig -p 2>/dev/null | grep -q "libgtk-3\.so\.0" || { err "libgtk-3 安装失败，Firefox 无法启动"; err "请检查 apt 源是否可用"; return 1; }
+    have_libgtk || { err "libgtk-3 安装失败，Firefox 无法启动"; err "请检查 apt 源是否可用"; return 1; }
     return 0
 }
 
@@ -342,20 +352,63 @@ subprocess.run([ff[0], "--headless", "--version"], capture_output=True, timeout=
         do_install_firefox_libs >/dev/null 2>&1 || true
     fi
 
+    # 安装后自检：验证 Firefox 在 xvfb 下能启动并开放调试端口（提前暴露沙箱/缺库问题）
+    info "运行安装自检..."
+    if xvfb-run -a "$VENV/bin/python" - <<'PYEOF' >/dev/null 2>&1
+import glob, subprocess, sys, time, socket
+ff = glob.glob("/root/.cache/ruyipage/browsers/firefox-*/firefox/firefox")
+if not ff:
+    sys.exit(1)
+port = 28901
+env = dict(__import__("os").environ)
+for k in ("MOZ_DISABLE_CONTENT_SANDBOX","MOZ_DISABLE_GMP_SANDBOX","MOZ_DISABLE_RDD_SANDBOX","MOZ_DISABLE_SOCKET_PROCESS_SANDBOX","MOZ_DISABLE_GPU_SANDBOX"):
+    env[k] = "1"
+p = subprocess.Popen([ff[0], f"--remote-debugging-port={port}", "--no-remote", "--marionette", "--profile", "/tmp/nh_selfcheck"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+ok = False
+for _ in range(60):
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=1)
+        s.close(); ok = True; break
+    except Exception:
+        time.sleep(1)
+p.terminate()
+try: p.wait(timeout=10)
+except Exception: p.kill()
+sys.exit(0 if ok else 1)
+PYEOF
+    then
+        ok "自检通过：Firefox 可正常启动"
+    else
+        warn "自检未通过（Firefox 可能无法启动），将尝试补齐 GUI 库后重试"
+        do_install_firefox_libs >/dev/null 2>&1 || true
+    fi
+
     ok "安装完成"
     return 0
 }
 
 # 补齐 Firefox GUI 库（独立函数，供自检失败时调用）
 do_install_firefox_libs() {
+    install_gui_libs
+}
+
+# 逐包安装 GUI 库：避免因单个包名不存在导致整条 apt install 失败（Debian 13 的 t64 改名）
+install_gui_libs() {
     command -v apt-get >/dev/null 2>&1 || return 0
     export DEBIAN_FRONTEND=noninteractive
-    apt-get install -y -qq \
+
+    local pkg alt
+    for pkg in \
         libgtk-3-0 libdbus-glib-1-2 libasound2 libxt6 libx11-xcb1 \
         libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
         libpango-1.0-0 libcairo2 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
-        libxkbcommon0 libxshmfence1 libdrm2 libxcb1 libnspr4 libnss3 \
-        >/dev/null 2>&1 || true
+        libxkbcommon0 libxshmfence1 libdrm2 libxcb1 libnspr4 libnss3
+    do
+        apt-get install -y -qq "$pkg" >/dev/null 2>&1 && continue
+        # 失败则尝试 Debian 13 的 t64 名称
+        alt="${pkg}t64"
+        apt-get install -y -qq "$alt" >/dev/null 2>&1 || true
+    done
     return 0
 }
 
@@ -690,6 +743,7 @@ menu() {
         echo -e "${GREEN}===============================================${NC}"
         echo -e " NeoHeberg AFK 管理脚本"
         echo -e " 服务状态: $st"
+        echo -e " 安装目录: $APP_DIR"
         echo -e "${GREEN}===============================================${NC}"
         echo -e " ${CYAN}[1]${NC} 安装与添加账号密码"
         echo -e " ${CYAN}[2]${NC} 配置 Telegram 通知"
