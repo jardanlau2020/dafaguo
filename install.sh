@@ -364,11 +364,19 @@ start_bot() {
         return 1
     fi
     cd "$APP_DIR"
+    # LXC/容器内 Firefox 沙箱会导致调试端口不开，必须禁用
+    export _NH_SANDBOX_OFF=1
     # setsid 脱离会话：SSH 断开也不会把挂机进程带走
     if command -v setsid >/dev/null 2>&1; then
-        setsid xvfb-run -a "$VENV/bin/python" "$SCRIPT" >> "$LOG" 2>&1 < /dev/null &
+        setsid xvfb-run -a -s "-screen 0 1024x768x24" env \
+            MOZ_DISABLE_CONTENT_SANDBOX=1 \
+            MOZ_DISABLE_GMP_SANDBOX=1 \
+            MOZ_DISABLE_RDD_SANDBOX=1 \
+            MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1 \
+            MOZ_DISABLE_GPU_SANDBOX=1 \
+            "$VENV/bin/python" "$SCRIPT" >> "$LOG" 2>&1 < /dev/null &
     else
-        nohup xvfb-run -a "$VENV/bin/python" "$SCRIPT" >> "$LOG" 2>&1 &
+        nohup env MOZ_DISABLE_CONTENT_SANDBOX=1 MOZ_DISABLE_GMP_SANDBOX=1 MOZ_DISABLE_RDD_SANDBOX=1 MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1 MOZ_DISABLE_GPU_SANDBOX=1 xvfb-run -a "$VENV/bin/python" "$SCRIPT" >> "$LOG" 2>&1 &
     fi
     echo $! > "$PID_FILE"
     sleep 3
@@ -550,6 +558,11 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=$APP_DIR
 EnvironmentFile=$ENV_FILE
+Environment=MOZ_DISABLE_CONTENT_SANDBOX=1
+Environment=MOZ_DISABLE_GMP_SANDBOX=1
+Environment=MOZ_DISABLE_RDD_SANDBOX=1
+Environment=MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
+Environment=MOZ_DISABLE_GPU_SANDBOX=1
 ExecStart=/usr/bin/xvfb-run -a $VENV/bin/python $SCRIPT
 EOF
 
