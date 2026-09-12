@@ -115,6 +115,12 @@ do_install_system_pkgs() {
     # venv 与 distutils（老 Python 3.9 必需）
     apt-get install -y -qq python3-venv python3-distutils python3-setuptools >/dev/null 2>&1 || true
 
+    # Debian 11 常见冲突：python3-setuptools 要求 pkg-resources=52.0.0-4，而系统已装 52.0.0-4+deb11u2。
+    # 用 --allow-downgrades 将两者同步到归档版，否则安装器一直报 held broken packages。
+    if ! python3 -c 'import distutils.cmd' >/dev/null 2>&1 || ! python3 -c 'import setuptools' >/dev/null 2>&1; then
+        apt-get install -y --allow-downgrades -qq \            python3-distutils=3.9.2-1 python3-lib2to3=3.9.2-1 \            python3-pkg-resources=52.0.0-4 python3-setuptools=52.0.0-4 \            >/dev/null 2>&1 || true
+    fi
+
     # xvfb（某些源里包名不同）
     if ! command -v xvfb-run >/dev/null 2>&1; then
         apt-get install -y -qq xvfb >/dev/null 2>&1 || true
@@ -161,6 +167,11 @@ ensure_venv() {
 
     # 老系统（如 Debian 11 + Python 3.9）：ensurepip 缺失，venv --without-pip + get-pip.py
     warn "常规 venv 创建失败（可能 ensurepip 缺失），改用 get-pip.py 引导..."
+
+    # get-pip.py 自身依赖 distutils.cmd，先确保它在
+    if ! python3 -c 'import distutils.cmd' >/dev/null 2>&1; then
+        apt-get install -y --allow-downgrades -qq python3-distutils=3.9.2-1 python3-lib2to3=3.9.2-1 >/dev/null 2>&1 || true
+    fi
     rm -rf "$VENV"
     python3 -m venv "$VENV" --without-pip >/dev/null 2>&1 || true
 
