@@ -54,6 +54,9 @@ STATE_FILE = os.path.join(WORK_DIR, "neoheberg_afk_state.json")
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID", "")
 
+# 通知名称：多台机器共用同一个 TG 机器人时，用来区分是哪台在报警
+NOTIFY_NAME   = os.environ.get("NOTIFY_NAME", "").strip()
+
 NH_WAIT       = int(os.environ.get("NH_WAIT", "65"))   
 if NH_WAIT < 60:
     NH_WAIT = 65
@@ -72,6 +75,9 @@ log = logging.getLogger("neoheberg-afk")
 def send_tg(text: str) -> None:
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
+    # 多台机器区分：配了 NOTIFY_NAME 就加一行标识头
+    if NOTIFY_NAME:
+        text = f"🖥️ <b>{NOTIFY_NAME}</b>\n{text}"
     try:
         data = json.dumps({"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}).encode()
         req = urllib.request.Request(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",

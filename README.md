@@ -41,6 +41,7 @@
 | `PASSWORD` | 是 | 登录密码 |
 | `TG_BOT_TOKEN` | 否 | Telegram 机器人 Token |
 | `TG_CHAT_ID` | 否 | Telegram chat id |
+| `NOTIFY_NAME` | 否 | 节点名称，多台机器共用同一 TG 机器人时用于区分（通知顶部加一行 🖥️ 名称） |
 | `PROXY` | 否 | 如 `socks5://user:pass@host:port` |
 | `NH_WAIT` | 否 | 每轮间隔秒数，默认 65 |
 

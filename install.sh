@@ -385,6 +385,7 @@ write_env_file() {
     [ -n "${PASSWORD:-}" ]     && echo "PASSWORD='${PASSWORD}'"         >> "$ENV_FILE"
     [ -n "${TG_BOT_TOKEN:-}" ] && echo "TG_BOT_TOKEN='${TG_BOT_TOKEN}'" >> "$ENV_FILE"
     [ -n "${TG_CHAT_ID:-}" ]   && echo "TG_CHAT_ID='${TG_CHAT_ID}'"     >> "$ENV_FILE"
+    [ -n "${NOTIFY_NAME:-}" ]  && echo "NOTIFY_NAME='${NOTIFY_NAME}'"   >> "$ENV_FILE"
     [ -n "${PROXY:-}" ]        && echo "PROXY='${PROXY}'"               >> "$ENV_FILE"
     [ -n "${NH_WAIT:-}" ]      && echo "NH_WAIT='${NH_WAIT}'"           >> "$ENV_FILE"
     return 0
@@ -623,14 +624,24 @@ menu_tg() {
     read -r in_chat || in_chat=""
     [ -z "$in_chat" ] && in_chat="${TG_CHAT_ID:-}"
 
-    TG_BOT_TOKEN="$in_token"; TG_CHAT_ID="$in_chat"
+    printf "节点名称（多台机器区分用，可留空）"
+    [ -n "${NOTIFY_NAME:-}" ] && printf " [当前: %s]" "$NOTIFY_NAME"
+    printf ": "
+    local in_name
+    read -r in_name || in_name=""
+    [ -z "$in_name" ] && in_name="${NOTIFY_NAME:-}"
+
+    TG_BOT_TOKEN="$in_token"; TG_CHAT_ID="$in_chat"; NOTIFY_NAME="$in_name"
     write_env_file
 
     if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+        local _test_text="✅ NeoHeberg 通知已配置成功"
+        [ -n "$NOTIFY_NAME" ] && _test_text="🖥️ ${NOTIFY_NAME}
+${_test_text}"
         info "正在发送测试消息..."
         if curl -fsS -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TG_CHAT_ID}" \
-            -d text="✅ NeoHeberg 通知已配置成功" >/dev/null 2>&1; then
+            -d text="${_test_text}" >/dev/null 2>&1; then
             ok "测试消息已发送，请查看 Telegram"
         else
             err "发送失败，请检查 Token 与 Chat ID"
@@ -682,6 +693,7 @@ menu_status() {
     echo "    账号：${EMAIL:-<未配置>}"
     if [ -n "${TG_BOT_TOKEN:-}" ] && [ -n "${TG_CHAT_ID:-}" ]; then
         echo "    TG 通知：已配置 (chat ${TG_CHAT_ID})"
+        echo "    节点名：${NOTIFY_NAME:-<未设置，通知里不带标识>}"
     else
         echo "    TG 通知：未配置"
     fi
@@ -728,7 +740,7 @@ menu_balance() {
     fi
 
     load_env
-    export EMAIL PASSWORD TG_BOT_TOKEN TG_CHAT_ID PROXY NH_WAIT
+    export EMAIL PASSWORD TG_BOT_TOKEN TG_CHAT_ID NOTIFY_NAME PROXY NH_WAIT
 
     info "正在查询，首次可能需要几秒（若 Cookie 失效会自动拉起浏览器登录）..."
     echo "    按 Ctrl+C 退出"
