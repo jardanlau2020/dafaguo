@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # ============================================================
 # NeoHeberg AFK 交互式管理脚本
-# 1 安装与添加账号密码
-# 2 配置 Telegram 通知
-# 3 查看运行状态
-# 4 卸载
+# 1 安装依赖
+# 2 账号密码
+# 3 配置 Telegram 通知
+# 4 查余额（实时刷新）
+# 5 每日定时挂机
+# 6 运行状态
+# 7 卸载
 # 0 退出
 # 用法：bash <(curl -fsSL https://raw.githubusercontent.com/xxbb678/neoheberg-oneclick/main/install.sh)
 # ============================================================
@@ -278,7 +281,28 @@ write_env_file() {
 # ---------------- 1. 安装与添加账号密码 ----------------
 menu_install() {
     echo ""
-    echo "${CYAN}=== 安装与添加账号密码 ===${NC}"
+    echo "${CYAN}=== 安装依赖与环境 ===${NC}"
+
+    if [ -x "$VENV/bin/python" ] && [ -f "$SCRIPT" ]; then
+        ok "依赖与主脚本已存在"
+        printf "是否重新检查/补齐？[y/N]: "
+        local ans
+        read -r ans || ans=""
+        case "$ans" in
+            y|Y|yes|YES) ;;
+            *) return 0 ;;
+        esac
+    fi
+
+    do_install_deps || return 1
+    ok "安装完成"
+    echo "    下一步：选菜单 [2] 填写账号密码"
+}
+
+# ---------- 账号密码 ----------
+menu_account() {
+    echo ""
+    echo "${CYAN}=== 账号密码 ===${NC}"
     load_env
 
     local def_email="${EMAIL:-}" in_email in_pass
@@ -304,19 +328,16 @@ menu_install() {
     write_env_file
     ok "账号密码已保存到 $ENV_FILE"
 
-    if [ -x "$VENV/bin/python" ] && [ -f "$SCRIPT" ]; then
-        ok "依赖与主脚本已存在，跳过安装"
-    else
-        do_install_deps || return 1
+    if pgrep -f "$SCRIPT" >/dev/null 2>&1; then
+        printf "账号修改需重启才生效，是否立即重启？[y/N]: "
+        local rr
+        read -r rr || rr=""
+        case "$rr" in
+            y|Y|yes|YES) stop_bot; start_bot ;;
+            *) info "请选菜单 [6] 重启使其生效" ;;
+        esac
     fi
-
-    printf "是否立即启动挂机？[y/N]: "
-    local ans
-    read -r ans || ans=""
-    case "$ans" in
-        y|Y|yes|YES) start_bot ;;
-        *) info "已保存，可选菜单 [3] 随时启动" ;;
-    esac
+    return 0
 }
 
 do_install_deps() {
@@ -570,6 +591,112 @@ menu_status() {
     esac
 }
 
+# ---------- 4. 查余额（实时刷新） ----------
+# 直接调用主脚本的余额接口（导入函数），避免重复实现登录与 CSRF 逻辑
+menu_balance() {
+    echo ""
+    echo "${CYAN}=== 余额查询（实时） ===${NC}"
+
+    if [ ! -f "$SCRIPT" ] || [ ! -x "$VENV/bin/python" ]; then
+        err "尚未安装，请先选菜单 [1]"
+        return 1
+    fi
+    if [ ! -f "$ENV_FILE" ]; then
+        err "未配置账号密码，请先选菜单 [2]"
+        return 1
+    fi
+
+    load_env
+    export EMAIL PASSWORD TG_BOT_TOKEN TG_CHAT_ID PROXY NH_WAIT
+
+    info "正在查询，首次可能需要几秒（若 Cookie 失效会自动拉起浏览器登录）..."
+    echo "    按 Ctrl+C 退出"
+    echo ""
+
+    cd "$APP_DIR"
+    _BALPY="$APP_DIR/.balance_check.py"
+    cat > "$_BALPY" <<'PYEOF'
+import os, sys, time
+
+# 直接执行主脚本源码，但先设 __name__ 非 __main__，避开 main() 与 sys.exit
+_script = os.environ.get("NH_SCRIPT", "neoheberg.py")
+with open(_script, encoding="utf-8") as _f:
+    _code = compile(_f.read(), _script, "exec")
+_ns = {"__name__": "nh_module", "__file__": _script}
+exec(_code, _ns)
+
+class _NH:
+    pass
+nh = _NH()
+for _k, _v in _ns.items():
+    if not _k.startswith("__"):
+        setattr(nh, _k, _v)
+
+def fmt(v):
+    return f"{v:.4f}" if isinstance(v, (int, float)) else str(v)
+
+state = nh.load_state()
+s = None
+last = None
+start = None
+rounds0 = state.get("rounds", 0)
+
+try:
+    s = nh.make_session(state)
+    try:
+        bal = nh._get_balance(s)
+    except PermissionError:
+        print("Cookie 失效，正在拉起浏览器重新登录...", flush=True)
+        s = nh.run_browser_extractor(state)
+        bal = nh._get_balance(s)
+    start = bal
+    last = bal
+    state["saved_cookies"] = s.cookies.get_dict()
+    nh.save_state(state)
+    print(f"初始余额: {fmt(bal)} 🪙", flush=True)
+    print("─" * 36, flush=True)
+except Exception as e:
+    print(f"❌ 查询失败: {type(e).__name__}: {e}", flush=True)
+    sys.exit(1)
+
+n = 0
+while True:
+    time.sleep(5)
+    n += 1
+    ts = time.strftime("%H:%M:%S")
+    try:
+        bal = nh._get_balance(s)
+        delta = bal - last if last is not None else 0.0
+        total = bal - start if start is not None else 0.0
+        arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "─")
+        print(f"[{ts}] 余额 {fmt(bal)} 🪙  ({arrow}{fmt(abs(delta))})  本次累计 +{fmt(total)}", flush=True)
+        last = bal
+        state["last_balance"] = bal
+        state["saved_cookies"] = s.cookies.get_dict()
+        nh.save_state(state)
+    except PermissionError:
+        print(f"[{ts}] Cookie 失效，重新登录...", flush=True)
+        try:
+            s = nh.run_browser_extractor(state)
+            last = None
+        except Exception as e:
+            print(f"[{ts}] 重登失败: {e}", flush=True)
+    except Exception as e:
+        print(f"[{ts}] 读取失败: {type(e).__name__}", flush=True)
+PYEOF
+
+    xvfb-run -a -s "-screen 0 1024x768x24" env \
+        MOZ_DISABLE_CONTENT_SANDBOX=1 \
+        MOZ_DISABLE_GMP_SANDBOX=1 \
+        MOZ_DISABLE_RDD_SANDBOX=1 \
+        MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1 \
+        MOZ_DISABLE_GPU_SANDBOX=1 \
+        NH_SCRIPT="$SCRIPT" \
+        "$VENV/bin/python" "$_BALPY"
+    rm -f "$_BALPY"
+    return 0
+}
+
 # ---------------- 每日 09:00 自动挂机（systemd timer） ----------------
 # 设计：每天 09:00 拉起挂机，刷满额度后脚本自行退出；次日 09:00 再次拉起。
 SCHED_SERVICE="neoheberg-afk-daily"
@@ -745,23 +872,27 @@ menu() {
         echo -e " 服务状态: $st"
         echo -e " 安装目录: $APP_DIR"
         echo -e "${GREEN}===============================================${NC}"
-        echo -e " ${CYAN}[1]${NC} 安装与添加账号密码"
-        echo -e " ${CYAN}[2]${NC} 配置 Telegram 通知"
-        echo -e " ${CYAN}[3]${NC} 查看运行状态"
-        echo -e " ${CYAN}[4]${NC} 每日定时挂机"
-        echo -e " ${CYAN}[5]${NC} 卸载"
+        echo -e " ${CYAN}[1]${NC} 安装依赖"
+        echo -e " ${CYAN}[2]${NC} 账号密码"
+        echo -e " ${CYAN}[3]${NC} 配置 Telegram 通知"
+        echo -e " ${CYAN}[4]${NC} 查余额"
+        echo -e " ${CYAN}[5]${NC} 每日定时挂机"
+        echo -e " ${CYAN}[6]${NC} 运行状态"
+        echo -e " ${CYAN}[7]${NC} 卸载"
         echo -e " ${CYAN}[0]${NC} 退出脚本"
         echo -e "${GREEN}===============================================${NC}"
-        printf "请输入数字选择 [0-5]: "
+        printf "请输入数字选择 [0-7]: "
         local choice
         read -r choice || choice="0"
 
         case "$choice" in
             1) menu_install ;;
-            2) menu_tg ;;
-            3) menu_status ;;
-            4) menu_schedule ;;
-            5) menu_uninstall ;;
+            2) menu_account ;;
+            3) menu_tg ;;
+            4) menu_balance ;;
+            5) menu_schedule ;;
+            6) menu_status ;;
+            7) menu_uninstall ;;
             0) echo "已退出"; exit 0 ;;
             *) err "无效选择"; sleep 1 ;;
         esac
@@ -776,7 +907,9 @@ menu() {
 need_root
 case "${1:-}" in
     install)   menu_install ;;
+    account)   menu_account ;;
     tg)        menu_tg ;;
+    balance)   menu_balance ;;
     status)    menu_status ;;
     schedule)  menu_schedule ;;
     uninstall|remove|del) menu_uninstall ;;
