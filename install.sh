@@ -67,13 +67,14 @@ fix_legacy_apt_sources() {
 
     # 将 sources.list 中的官方域名替换为归档站，并关掉过期校验
     if [ -f /etc/apt/sources.list ]; then
+        # 1) 将主源域名换为归档站（兼容 /debian 与无后缀两种写法）
         sed -i \
-            -e "s|https\?://deb\.debian\.org/debian-security|http://archive.debian.org/debian-security|g" \
-            -e "s|https\?://security\.debian\.org/debian-security|http://archive.debian.org/debian-security|g" \
-            -e "s|https\?://deb\.debian\.org/debian|http://archive.debian.org/debian|g" \
+            -e "s|https\?://deb\.debian\.org|http://archive.debian.org|g" \
             /etc/apt/sources.list
-        # 归档源的 debian-security 不再提供 Release，删掉该行避免 apt update 报错
-        sed -i "/archive\.debian\.org\/debian-security/d" /etc/apt/sources.list
+        # 2) security 行直接删除：无论域名如何写，归档站都不再提供可用的 security Release
+        sed -i "/security\.debian\.org/d; /debian-security/d" /etc/apt/sources.list
+        # 3) 删除 backports 行
+        sed -i "/backports/d" /etc/apt/sources.list
     fi
 
     # 关闭 Valid-Until 校验（归档源签名时间很旧）
@@ -85,7 +86,7 @@ fix_legacy_apt_sources() {
         for _f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
             [ -f "$_f" ] || continue
             # 将子文件里的官方域名也改为归档站，并删除 backports/security 行
-            sed -i                 -e "s|https\?://deb\.debian\.org/debian|http://archive.debian.org/debian|g"                 -e "s|https\?://security\.debian\.org/debian-security|http://archive.debian.org/debian-security|g"                 -e "/backports/d"                 -e "/debian-security/d"                 "$_f" 2>/dev/null || true
+            sed -i -e "s|https\?://deb\.debian\.org|http://archive.debian.org|g" -e "/security\.debian\.org/d" -e "/backports/d" -e "/debian-security/d" "$_f" 2>/dev/null || true
             # 内容空了就删掉整个文件
             if ! grep -qE "^[[:space:]]*deb" "$_f" 2>/dev/null; then
                 rm -f "$_f"
