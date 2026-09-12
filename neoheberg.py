@@ -15,6 +15,7 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 # 北京时间 (UTC+8)
 TZ_BJ = timezone(timedelta(hours=8))
@@ -292,7 +293,7 @@ def _get_csrf(s: requests.Session) -> tuple:
     if m: return m.group(1), m.group(2)
     raise RuntimeError("csrf token 未找到")
 
-def gen_callback(s: requests.Session, csrf_name: str, csrf_val: str) -> str | None:
+def gen_callback(s: requests.Session, csrf_name: str, csrf_val: str) -> Optional[str]:
     data = {csrf_name: csrf_val}
     r = s.post(ADS_URL, data=data, allow_redirects=False, timeout=20)
     loc = r.headers.get("Location")

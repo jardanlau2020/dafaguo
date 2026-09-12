@@ -50,6 +50,52 @@ apt_repo_alive() {
     curl -fsS --max-time 12 -o /dev/null "${url}/dists/${2}/Release" 2>/dev/null
 }
 
+# 失效的 security 源：索引仍可拉取，但包体已 404（指数会优先选中这些不存在的新版，导致整个 install 失败）。
+# 常见于 bullseye 等 EOL 发行版：security 池子被清理，但 InRelease 还在。
+# 处理：无条件移除 security 源（仅 Debian），让 apt 只从主源取基准版本。
+# 主源一般包含同等或旧一点的安全补丁（如 xvfb u13），足够满足依赖。
+drop_dead_security_source() {
+    [ "$(os_id)" = "debian" ] || return 0
+    command -v apt-get >/dev/null 2>&1 || return 0
+
+    local codename
+    codename=$(os_codename)
+    # 仅处理已 EOL 的老发行版；bookworm 之后 security 源仍正常，动了反而有安全风险
+    case "$codename" in
+        bullseye|buster|stretch|jessie) ;;
+        *) return 0 ;;
+    esac
+
+    # 已处理过就不重复（用 marker 文件记录）
+    [ -f /etc/apt/apt.conf.d/99neoheberg-dead-security-dropped ] && return 0
+
+    local changed=0
+    if [ -f /etc/apt/sources.list ] && grep -qE 'security\.debian\.org|debian-security' /etc/apt/sources.list 2>/dev/null; then
+        cp -n /etc/apt/sources.list "/etc/apt/sources.list.bak.$(date +%s)" 2>/dev/null || true
+        sed -i '/security\.debian\.org/d; /debian-security/d' /etc/apt/sources.list
+        changed=1
+    fi
+
+    if [ -d /etc/apt/sources.list.d ]; then
+        local _f
+        for _f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            [ -f "$_f" ] || continue
+            if grep -qE 'security\.debian\.org|debian-security' "$_f" 2>/dev/null; then
+                sed -i '/security\.debian\.org/d; /debian-security/d' "$_f" 2>/dev/null || true
+                grep -qE '^[[:space:]]*deb' "$_f" 2>/dev/null || rm -f "$_f"
+                changed=1
+            fi
+        done
+    fi
+
+    if [ "$changed" = "1" ]; then
+        warn "已移除失效的 ${codename}-security 源（EOL 后包体已 404，保留只会导致安装失败）"
+        rm -rf /var/lib/apt/lists/* 2>/dev/null || true
+    fi
+    : > /etc/apt/apt.conf.d/99neoheberg-dead-security-dropped 2>/dev/null || true
+    return 0
+}
+
 # 老系统（已 EOL）自动改用 archive.debian.org 归档源
 # 仅处理 Debian 官方源行，不碰第三方源；且仅在原源已失效时改写
 fix_legacy_apt_sources() {
@@ -115,11 +161,61 @@ have_libgtk() {
     return 1
 }
 
+# bullseye 已 EOL：security 池子被清理后，会出现一种伪健康状态：
+#   - apt-get update 成功（索引还在）
+#   - 但 apt-get install 下载包体时 404，或因版本断层报 held broken packages
+# 典型例子：python3.9 已装 3.9.2-1+deb11u7（来自已失效的 security 源），
+# 而 deb.debian.org 上的 python3.9-venv 只有 3.9.2-1，它要求 python3.9 (= 3.9.2-1)
+# → 版本对不上 → venv 永远装不上。
+# 处理：检测到这种 mismatch 时，把带 +debXXuY 后缀的包降级到基准版本，使依赖重新对齐。
+fix_eol_version_mismatch() {
+    command -v apt-get >/dev/null 2>&1 || return 0
+    command -v dpkg >/dev/null 2>&1 || return 0
+
+    # 只针对 Debian bullseye（其他版本不做，避免误伤）
+    local codename
+    codename=$(os_codename)
+    [ "$codename" = "bullseye" ] || return 0
+
+    # 检测：python3.9-venv 是否因版本不匹配而装不上
+    local want have
+    have=$(dpkg-query -W -f='${Version}' python3.9 2>/dev/null || echo "")
+    case "$have" in
+        *"+deb11u"*) ;;
+        *) return 0 ;;   # 已是基准版本或未安装，无需处理
+    esac
+
+    # 已有 venv 就不动
+    dpkg-query -W python3.9-venv >/dev/null 2>&1 && return 0
+
+    # 目标基准版本：去掉 +debXXuY 后缀
+    local base="${have%%+*}"
+    [ -n "$base" ] || return 0
+
+    warn "检测到 bullseye security 源失效导致的版本断层（python3.9=${have}）"
+    info "将 python3.9 降级到 ${base} 以恢复依赖对齐..."
+
+    apt-get install -y --allow-downgrades -qq \
+        "python3.9=${base}" "python3.9-minimal=${base}" \
+        "libpython3.9-stdlib=${base}" "libpython3.9-minimal=${base}" \
+        >/dev/null 2>&1 || true
+
+    if dpkg-query -W python3.9-venv >/dev/null 2>&1; then
+        ok "版本对齐完成，python3.9-venv 已可安装"
+    fi
+    return 0
+}
+
 do_install_system_pkgs() {
     command -v apt-get >/dev/null 2>&1 || { err "未检测到 apt-get，仅支持 Debian/Ubuntu"; return 1; }
 
     export DEBIAN_FRONTEND=noninteractive
     fix_legacy_apt_sources
+
+    # EOL security 源清理后常见：索引可用但包体 404 / 版本断层
+    # 先把失效的 security 源摘掉，避免 apt 优选到已不存在的新版包
+    drop_dead_security_source
+    fix_eol_version_mismatch
 
     # 归档源域名在老系统上可能走 IPv6，确保 apt 不因网络报错而卡死
     apt-get update -qq 2>/tmp/neoheberg-apt-update.log || true
@@ -131,7 +227,13 @@ do_install_system_pkgs() {
     apt-get install -y -qq python3 python3-pip curl ca-certificates xauth >/dev/null 2>&1 || true
 
     # venv 与 distutils（老 Python 3.9 必需）
-    apt-get install -y -qq python3-venv python3-distutils python3-setuptools >/dev/null 2>&1 || true
+    # 若因版本断层装不上，重试一次并显式告警（而非静默 || true）
+    if ! apt-get install -y -qq python3-venv python3-distutils python3-setuptools >/dev/null 2>&1; then
+        warn "python3-venv/distutils 安装失败，尝试修复依赖..."
+        fix_eol_version_mismatch
+        apt-get update -qq 2>/dev/null || true
+        apt-get install -y -qq python3-venv python3-distutils python3-setuptools >/dev/null 2>&1 || true
+    fi
 
     # Debian 11 常见冲突：python3-setuptools 要求 pkg-resources=52.0.0-4，而系统已装 52.0.0-4+deb11u2。
     # 用 --allow-downgrades 将两者同步到归档版，否则安装器一直报 held broken packages。
@@ -243,14 +345,24 @@ do_install_py_deps() {
 }
 
 # 主脚本语法适配：Python < 3.10 不支持 X | Y 类型注解，自动降级为 object
+# 用 venv 的 Python 判版本（而非系统 python3），避免系统/虚拟环境版本不一致时误判
 adapt_script_for_old_python() {
     [ -f "$SCRIPT" ] || return 0
-    local pyver
-    pyver=$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "3.9")
+
+    local pybin pyver
+    if [ -x "$VENV/bin/python" ]; then
+        pybin="$VENV/bin/python"
+    else
+        pybin="python3"
+    fi
+    pyver=$("$pybin" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "3.9")
+
     case "$pyver" in
         3.9|3.8|3.7|3.6)
-            if grep -q 'str | None' "$SCRIPT" 2>/dev/null; then
-                sed -i 's/-> str | None:/-> object:/g' "$SCRIPT"
+            # 通用化：匹配任意 "X | Y" 返回注解（str | None、int | None、list[str] | None 等），
+            # 统一降级为 object。原来只匹配字面量 'str | None'，脚本一改注解就会漏掉。
+            if grep -qE -- '->[[:space:]]*[A-Za-z_][A-Za-z0-9_.\[\], ]*[[:space:]]*\|[[:space:]]*[A-Za-z_]' "$SCRIPT" 2>/dev/null; then
+                sed -i -E 's/->[[:space:]]*([A-Za-z_][A-Za-z0-9_.\[\], ]*)[[:space:]]*\|[[:space:]]*([A-Za-z_][A-Za-z0-9_.\[\], ]*)/-> object/g' "$SCRIPT"
                 info "已适配 Python ${pyver}（X | Y 注解 → object）"
             fi
             ;;
@@ -359,7 +471,16 @@ do_install_deps() {
         curl -fsSL "$REPO_RAW/neoheberg.py" -o "$SCRIPT" || { err "脚本下载失败"; return 1; }
     fi
 
+    # 下载后必须先适配老 Python 注解，否则语法检查/启动会直接报错
     adapt_script_for_old_python || true
+
+    # 提前做一次语法自检：老 Python 注解、缩进等问题在这里暴露，而不是启动时才炸
+    if ! "$VENV/bin/python" -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$SCRIPT" >/dev/null 2>&1; then
+        err "主脚本语法自检失败（Python $(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)）：$SCRIPT"
+        err "查看详情: $VENV/bin/python -c 'import ast;ast.parse(open(\"$SCRIPT\").read())'"
+        return 1
+    fi
+    ok "主脚本语法自检通过"
 
     # 实测 Firefox 能否启动，提前暴露缺库问题
     if ! xvfb-run -a "$VENV/bin/python" -c '
