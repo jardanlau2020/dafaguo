@@ -57,12 +57,15 @@ fix_legacy_apt_sources() {
     codename=$(os_codename)
     [ -z "$codename" ] && return 0
 
-    # 当前官方源还能用就不动
-    if apt_repo_alive "http://deb.debian.org/debian" "$codename"; then
+    # 关掉 Valid-Until 校验（归档源签名时间很旧）——这一步无条件做，不依赖探测
+    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99neoheberg-no-valid-until
+
+    # 先试一次 apt update：成功则不动源，失败（EOL/过期/404）则无条件切归档站
+    if apt-get update -qq >/dev/null 2>&1; then
         return 0
     fi
 
-    warn "检测到 Debian $codename 官方源已失效（EOL），自动切换到 archive.debian.org"
+    warn "检测到 Debian $codename 官方源不可用，自动切换到 archive.debian.org"
     [ -f /etc/apt/sources.list ] && cp -n /etc/apt/sources.list "/etc/apt/sources.list.bak.$(date +%s)" 2>/dev/null || true
 
     # 将 sources.list 中的官方域名替换为归档站，并关掉过期校验
@@ -76,9 +79,6 @@ fix_legacy_apt_sources() {
         # 3) 删除 backports 行
         sed -i "/backports/d" /etc/apt/sources.list
     fi
-
-    # 关闭 Valid-Until 校验（归档源签名时间很旧）
-    echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99neoheberg-no-valid-until
 
     # 子目录里的旧源（backports、security 等）一并处理：已不存在于归档站，保留只会让 apt update 报错
     if [ -d /etc/apt/sources.list.d ]; then
