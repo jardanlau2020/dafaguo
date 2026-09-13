@@ -22,7 +22,7 @@ TZ_BJ = timezone(timedelta(hours=8))
 
 # ================= 导入防指纹请求库与浏览器自动化库 =================
 try:
-    from curl_cffi import requests
+    from curl_cffi import requests, CurlOpt
 except ImportError:
     print("❌ 缺少依赖！请先在终端执行: pip install curl_cffi")
     sys.exit(1)
@@ -324,6 +324,13 @@ def redeem(s: requests.Session, callback: str) -> int:
 
 def make_session(state: dict) -> requests.Session:
     s = requests.Session(impersonate="chrome120")
+    # 强制 IPv4：本机 WARP 只代理 IPv4，走原生 IPv6 会被 Cloudflare 403 拦截。
+    # 可用 NH_FORCE_IPV6=1 关闭此行为。
+    if os.environ.get("NH_FORCE_IPV6", "").strip() not in ("1", "true", "yes"):
+        try:
+            s.curl_options = {CurlOpt.IPRESOLVE: 1}
+        except Exception:
+            pass
     _px = os.environ.get("PROXY", "").strip()
     if _px:
         _pxh = _px.replace("socks5://", "socks5h://")
