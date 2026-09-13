@@ -768,6 +768,16 @@ for _k, _v in _ns.items():
 def fmt(v):
     return f"{v:.4f}" if isinstance(v, (int, float)) else str(v)
 
+def _merge_save(state, updates):
+    """只合并本进程负责的字段：先重读磁盘再写回，避免用旧快照把主脚本的 day_date / rounds / day_rounds 覆盖掉。"""
+    try:
+        disk = nh.load_state()
+    except Exception:
+        disk = dict(state)
+    disk.update(updates)
+    nh.save_state(disk)
+    state.update(updates)
+
 state = nh.load_state()
 s = None
 last = None
@@ -784,8 +794,7 @@ try:
         bal = nh._get_balance(s)
     start = bal
     last = bal
-    state["saved_cookies"] = s.cookies.get_dict()
-    nh.save_state(state)
+    _merge_save(state, {"saved_cookies": s.cookies.get_dict(), "last_balance": bal})
     print(f"初始余额: {fmt(bal)} 🪙", flush=True)
     print("─" * 36, flush=True)
 except Exception as e:
@@ -804,9 +813,7 @@ while True:
         arrow = "↑" if delta > 0 else ("↓" if delta < 0 else "─")
         print(f"[{ts}] 余额 {fmt(bal)} 🪙  ({arrow}{fmt(abs(delta))})  本次累计 +{fmt(total)}", flush=True)
         last = bal
-        state["last_balance"] = bal
-        state["saved_cookies"] = s.cookies.get_dict()
-        nh.save_state(state)
+        _merge_save(state, {"last_balance": bal, "saved_cookies": s.cookies.get_dict()})
     except PermissionError:
         print(f"[{ts}] Cookie 失效，重新登录...", flush=True)
         try:
