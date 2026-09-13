@@ -91,7 +91,7 @@ def load_state() -> dict:
         with open(STATE_FILE) as f:
             return json.load(f)
     except Exception:
-        return {"start_balance": None, "total": 0.0, "rounds": 0, "day_rounds": 0, "last_report": 0, "last_balance": None, "zero_gain_streak": 0, "saved_cookies": {}}
+        return {"start_balance": None, "day_start_balance": None, "total": 0.0, "rounds": 0, "day_rounds": 0, "last_report": 0, "last_balance": None, "zero_gain_streak": 0, "saved_cookies": {}}
 
 def save_state(state: dict) -> None:
     try:
@@ -354,11 +354,11 @@ def report(state: dict, balance: float, force: bool = False) -> None:
     if not force and now - state.get("last_report", 0) < 3600: return
     state["last_report"] = now
     save_state(state)
-    earned = (balance - state.get("start_balance")) if state.get("start_balance") is not None else 0.0
+    earned = (balance - state.get("day_start_balance")) if state.get("day_start_balance") is not None else 0.0
     ts = datetime.now(TZ_BJ).strftime("%Y-%m-%d %H:%M 北京时间")
-    msg = (f"🪄 NeoHeberg AFK\n📅 {ts}\n\n💰 <b>余额</b>: {balance:.4f} 🪙\n📈 <b>本轮收益</b>: +{earned:.4f} 🪙（今日 {state.get('day_rounds', 0)} 轮）")
+    msg = (f"🪄 NeoHeberg AFK\n📅 {ts}\n\n💰 <b>余额</b>: {balance:.4f} 🪙\n📈 <b>今日收益</b>: +{earned:.4f} 🪙（今日 {state.get('day_rounds', 0)} 轮）")
     send_tg(msg)
-    log.info("TG 报告: 余额=%s 收益=%s", balance, earned)
+    log.info("TG 报告: 余额=%s 今日收益=%s", balance, earned)
 
 def run_browser_extractor(state: dict) -> requests.Session:
     log.warning("⚠️ 呼叫浏览器先锋队提取全新 Cookie...")
@@ -380,6 +380,8 @@ def main() -> None:
     _today = datetime.now(TZ_BJ).strftime("%Y-%m-%d")
     if state.get("day_date") != _today:
         state["day_rounds"] = 0
+        # 切日：记录当日起点余额，用于计算真正的当日收益（下方读到余额后回填）
+        state["day_start_balance"] = None
         state["day_date"] = _today
         log.info("新的一天 %s，单日轮次已归零", _today)
     else:
@@ -392,6 +394,7 @@ def main() -> None:
         if not state.get("saved_cookies"): raise PermissionError("首次运行无缓存")
         bal = _get_balance(s)
         if state.get("start_balance") is None: state["start_balance"] = bal
+        if state.get("day_start_balance") is None: state["day_start_balance"] = bal
         state["last_balance"] = bal  # 为兑换真实性校验建立基准值
         log.info("启动成功，缓存 Cookie 有效，当前余额: %s", bal)
         report(state, bal, force=True)
@@ -407,6 +410,7 @@ def main() -> None:
                 s = make_session(state)
                 bal = _get_balance(s)
                 if state.get("start_balance") is None: state["start_balance"] = bal
+                if state.get("day_start_balance") is None: state["day_start_balance"] = bal
                 state["last_balance"] = bal
                 log.info("启动成功(重试)，当前余额: %s", bal)
                 report(state, bal, force=True)
@@ -425,6 +429,7 @@ def main() -> None:
         try:
             bal = _get_balance(s)
             if state.get("start_balance") is None: state["start_balance"] = bal
+            if state.get("day_start_balance") is None: state["day_start_balance"] = bal
             state["last_balance"] = bal
             log.info("✅ 新 Cookie 验证通过！当前余额: %s", bal)
             report(state, bal, force=True)
@@ -451,7 +456,7 @@ def main() -> None:
                 if bal_end is not None:
                     state["last_balance"] = bal_end
                     save_state(state)
-                earned = (bal_end - state["start_balance"]) if (bal_end is not None and state.get("start_balance") is not None) else None
+                earned = (bal_end - state["day_start_balance"]) if (bal_end is not None and state.get("day_start_balance") is not None) else None
                 if earned is not None:
                     msg = (f"🎉 NeoHeberg 今日挂机结束\n\n"
                            f"✅ 广告额度：100/100 已刷满\n"
