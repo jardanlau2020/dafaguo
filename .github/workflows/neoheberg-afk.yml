@@ -63,6 +63,7 @@ jobs:
           NH_WAIT: '65'
           PROXY: ${{ env.PROXY_SERVER }}
         run: |
+          set -o pipefail   # 貼住 python 嘅 exit code，唔好俾 tee 食咗
           mkdir -p "$BROWSER_WORK_DIR"
           xvfb-run -a -s "-screen 0 1280x800x24" python neoheberg.py 2>&1 | tee afk.log
 
