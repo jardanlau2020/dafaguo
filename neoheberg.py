@@ -127,7 +127,20 @@ class NeohebergLoginBot:
         try:
             log.info("🤖 启动 Firefox 浏览器准备全自动打盾提取 Cookie...")
             opts = FirefoxOptions()
-            opts.set_browser_path("/root/.cache/ruyipage/browsers/firefox-155.0-v1.2.69-linux-x86_64/firefox/firefox")
+            # 晴天 patch: 自動偵測 ruyipage Firefox 路徑（原版 hardcode firefox-155.0 版本路徑，換環境即炸）
+            _ff = os.environ.get("NH_FIREFOX_PATH", "").strip()
+            if not _ff:
+                import glob as _g
+                for _home in (os.path.expanduser("~"), "/root"):
+                    for _c in sorted(_g.glob(os.path.join(_home, ".cache/ruyipage/browsers/firefox-*/firefox/firefox"))):
+                        if os.path.exists(_c):
+                            _ff = _c
+                            break
+                    if _ff:
+                        break
+            if _ff:
+                opts.set_browser_path(_ff)
+                log.info(f"🦊 Firefox 路徑: {_ff}")
             if self.profile_dir:
                 opts.set_profile(self.profile_dir)
             if self.proxy_url:
