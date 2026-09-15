@@ -47,6 +47,11 @@ jobs:
           pip install --quiet curl_cffi ruyipage
           python -m ruyipage install
 
+      - name: Setup residential proxy (sing-box via NODE_LINK)
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: bash ./setup_proxy.sh
+
       - name: Run AFK
         env:
           EMAIL: ${{ secrets.NH_EMAIL }}
@@ -56,6 +61,7 @@ jobs:
           NOTIFY_NAME: NeoHeberg-GHA
           BROWSER_WORK_DIR: ${{ github.workspace }}/browser-work
           NH_WAIT: '65'
+          PROXY: ${{ env.PROXY_SERVER }}
         run: |
           mkdir -p "$BROWSER_WORK_DIR"
           xvfb-run -a -s "-screen 0 1280x800x24" python neoheberg.py 2>&1 | tee afk.log
