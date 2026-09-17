@@ -1,0 +1,52 @@
+name: NH Login Check
+
+# 診斷用：只用真瀏覽器登入一次（過 CF + 點 Cap 驗證碼），打印結果就收工。
+# 唔會跑 AFK 迴圈、唔會發 TG。手動 workflow_dispatch 觸發。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps + Chromium
+        run: |
+          pip install --quiet curl_cffi playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Login check
+        env:
+          EMAIL: ${{ secrets.NH_EMAIL }}
+          PASSWORD: ${{ secrets.NH_PASSWORD }}
+          BROWSER_WORK_DIR: ${{ github.workspace }}/browser-work
+          NH_HEADLESS: '1'
+          NH_CAP_WAIT: '60'
+        run: |
+          mkdir -p "$BROWSER_WORK_DIR"
+          xvfb-run -a python - <<'PY'
+          import os
+          import sys
+
+          sys.path.insert(0, os.getcwd())
+          import neoheberg as nh
+
+          bot = nh.NeohebergLoginBot()
+          print(f"[check] email={'set' if bot.email else 'MISSING'} "
+                f"headless={bot.headless} proxy={bool(bot.proxy_url)}")
+          cookies = bot.run()
+          print(f"[check] 取得 cookie 數: {len(cookies)}")
+          print(f"[check] cookie 名: {sorted(cookies)[:20]}")
+          assert cookies, "❌ 登入失敗：冇攞到任何 cookie"
+          print("✅ 登入成功——Cap 驗證碼關卡已通過")
+          PY
