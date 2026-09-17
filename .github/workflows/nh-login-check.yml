@@ -5,6 +5,11 @@ name: NH Login Check
 
 on:
   workflow_dispatch:
+    inputs:
+      use_proxy:
+        description: '先用 NODE_LINK 起住宅/機房代理，再經代理登入'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -12,7 +17,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -25,6 +30,13 @@ jobs:
           pip install --quiet curl_cffi playwright
           python -m playwright install --with-deps chromium
 
+      - name: Setup proxy (optional)
+        if: ${{ inputs.use_proxy }}
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: bash ./setup_proxy.sh
+
       - name: Login check
         env:
           EMAIL: ${{ secrets.NH_EMAIL }}
@@ -32,6 +44,7 @@ jobs:
           BROWSER_WORK_DIR: ${{ github.workspace }}/browser-work
           NH_HEADLESS: '1'
           NH_CAP_WAIT: '60'
+          PROXY: ${{ env.PROXY_SERVER }}
         run: |
           mkdir -p "$BROWSER_WORK_DIR"
           xvfb-run -a python - <<'PY'
@@ -43,10 +56,12 @@ jobs:
 
           bot = nh.NeohebergLoginBot()
           print(f"[check] email={'set' if bot.email else 'MISSING'} "
-                f"headless={bot.headless} proxy={bool(bot.proxy_url)}")
+                f"headless={bot.headless} proxy={bot.proxy_url or '(直連)'}")
           cookies = bot.run()
           print(f"[check] 取得 cookie 數: {len(cookies)}")
           print(f"[check] cookie 名: {sorted(cookies)[:20]}")
-          assert cookies, "❌ 登入失敗：冇攞到任何 cookie"
+          if not cookies:
+              print("❌ 登入失敗")
+              sys.exit(1)
           print("✅ 登入成功——Cap 驗證碼關卡已通過")
           PY
