@@ -28,9 +28,9 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from ruyipage import FirefoxPage, FirefoxOptions
+    from playwright.sync_api import sync_playwright
 except ImportError:
-    print("❌ 缺少依赖！请先在终端执行: pip install ruyipage")
+    print("❌ 缺少依赖！请先执行: pip install playwright && python -m playwright install chromium")
     sys.exit(1)
 # =============================================================
 
@@ -38,6 +38,8 @@ except ImportError:
 # 全局配置
 # ════════════════════════════════════════════════════════════════════
 BASE = "https://dash.neoheberg.fr"
+UA_CHROME = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 ADS_URL = f"{BASE}/shop/ads"
 LOGIN_URL = f"{BASE}/login"
 
@@ -102,173 +104,207 @@ def save_state(state: dict) -> None:
         pass
 
 # ════════════════════════════════════════════════════════════════════
-# 浏览器“先锋队”模块
+# ════════════════════════════════════════════════════════════════════
+# 浏览器“先锋队”模块（Playwright + Chromium）
+#
+# 2026-09-17 重写：站方登录闸**唔系** Cloudflare Turnstile，而系自架 Cap 验证码
+# （cap-widget v0.1.57，endpoint https://trycap.axel-l.fr/6a74828fe6/，PoW + 行为探针）。
+# 旧版死等一个唔存在嘅 `cf-turnstile-response`，所以永远交唔到 `cap-token` → 必败。
+#
+# 实测通过嘅新流程（真 Chromium，机房 IP 都过）：
+#   填 email → 按「继续」→ 填密码 → **点击 cap-widget**
+#   → widget 自己跑 sha256 PoW（约 5~6 秒）并填好 `input[name=cap-token]` → 提交。
 # ════════════════════════════════════════════════════════════════════
 class NeohebergLoginBot:
+    """用真浏览器完成登录（过 CF 盾 + 点 Cap 验证码），回传 Cookie 字典。"""
+
     def __init__(self):
-        self.email = os.environ.get("EMAIL", "")
+        self.email = os.environ.get("EMAIL", "").strip()
         self.password = os.environ.get("PASSWORD", "")
-        self.proxy_url = os.environ.get("PROXY", "")
-        self.profile_dir = os.environ.get("BROWSER_USER_DATA_DIR", "").strip()
-        
+        self.proxy_url = os.environ.get("PROXY", "").strip()
+        self.headless = os.environ.get("NH_HEADLESS", "1").strip() != "0"
+        self.chromium_path = os.environ.get("NH_CHROMIUM_PATH", "").strip()
+        self.cap_wait = int(os.environ.get("NH_CAP_WAIT", "60"))
+
+    # ---------------------------- 工具 ----------------------------
+    @staticmethod
+    def _title(pg) -> str:
+        try:
+            return (pg.title() or "").lower()
+        except Exception:
+            return ""
+
+    def _wait_past_cf(self, pg, timeout: int = 45) -> bool:
+        """等 Cloudflare 托管盾自己过（真浏览器通常 3~10 秒自动放行）。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            t = self._title(pg)
+            if "just a moment" not in t and "un instant" not in t:
+                return True
+            time.sleep(1)
+        return False
+
+    @staticmethod
+    def _cap_token(pg) -> str:
+        try:
+            return pg.evaluate(
+                """() => { const e = document.querySelector('input[name="cap-token"]');"""
+                """ return e ? (e.value || "") : ""; }"""
+            ) or ""
+        except Exception:
+            return ""
+
+    def _solve_cap(self, pg) -> bool:
+        """点击 Cap widget，等佢自己跑完 PoW 并把 cap-token 填好。"""
+        try:
+            widget = pg.query_selector("cap-widget")
+        except Exception:
+            widget = None
+        if widget is None:
+            log.warning("⚠️ 页面揾唔到 cap-widget（站方可能改版），照样尝试直接提交…")
+            return True
+        for attempt in range(1, 4):
+            if self._cap_token(pg):
+                return True
+            try:
+                box = widget.bounding_box()
+            except Exception:
+                box = None
+            if not box:
+                log.info("⏳ cap-widget 暂时唔可见（未到第二步？）等一等…")
+                time.sleep(2)
+                continue
+            log.info(" [第 %d/3 次] 点击 Cap 验证码 widget …", attempt)
+            try:
+                pg.mouse.move(box["x"] + 30, box["y"] + 25)
+                time.sleep(0.3)
+                pg.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            except Exception as e:
+                log.warning("   点击异常: %s", e)
+            for sec in range(self.cap_wait):
+                time.sleep(1)
+                if self._cap_token(pg):
+                    log.info("   ✅ %ds 拿到 cap-token", sec + 1)
+                    return True
+            log.warning("   本轮 %ds 内未拿到 cap-token，重试…", self.cap_wait)
+        return bool(self._cap_token(pg))
+
+    # ---------------------------- 主流程 ----------------------------
     def run(self) -> dict:
         if not self.email or not self.password:
             log.error("❌ 浏览器获取 Cookie 失败：未配置 EMAIL 或 PASSWORD 环境变量！")
             return {}
 
-        if self.profile_dir and os.path.exists(self.profile_dir):
-            for lock_name in ['lock', '.parentlock', 'parent.lock']:
-                lf = os.path.join(self.profile_dir, lock_name)
-                if os.path.exists(lf):
-                    try: os.remove(lf)
-                    except: pass
-
-        page = None
+        pw = browser = None
         try:
-            log.info("🤖 启动 Firefox 浏览器准备全自动打盾提取 Cookie...")
-            opts = FirefoxOptions()
-            # 晴天 patch: 自動偵測 ruyipage Firefox 路徑（原版 hardcode firefox-155.0 版本路徑，換環境即炸）
-            _ff = os.environ.get("NH_FIREFOX_PATH", "").strip()
-            if not _ff:
-                import glob as _g
-                for _home in (os.path.expanduser("~"), "/root"):
-                    for _c in sorted(_g.glob(os.path.join(_home, ".cache/ruyipage/browsers/firefox-*/firefox/firefox"))):
-                        if os.path.exists(_c):
-                            _ff = _c
-                            break
-                    if _ff:
-                        break
-            if _ff:
-                opts.set_browser_path(_ff)
-                log.info(f"🦊 Firefox 路徑: {_ff}")
-            if self.profile_dir:
-                opts.set_profile(self.profile_dir)
+            log.info("🤖 启动 Chromium（Playwright）准备登录 + 提取 Cookie…")
+            pw = sync_playwright().start()
+            launch_kw = {
+                "headless": self.headless,
+                "args": ["--no-sandbox", "--disable-dev-shm-usage",
+                         "--disable-blink-features=AutomationControlled"],
+            }
+            if self.chromium_path:
+                launch_kw["executable_path"] = self.chromium_path
             if self.proxy_url:
-                opts.set_proxy(self.proxy_url)
-            
-            opts.headless(False)
-            page = FirefoxPage(opts)
+                launch_kw["proxy"] = {"server": self.proxy_url}
+                log.info("🌐 浏览器走代理: %s", self.proxy_url.split("@")[-1])
+            browser = pw.chromium.launch(**launch_kw)
+            ctx = browser.new_context(
+                user_agent=UA_CHROME,
+                viewport={"width": 1366, "height": 900},
+                locale="fr-FR",
+                timezone_id="Europe/Paris",
+            )
+            pg = ctx.new_page()
 
-            log.info(f"🔗 正在访问探路页面: {ADS_URL}")
-            page.get(ADS_URL)
-            time.sleep(5)
+            log.info("🔗 访问登录页: %s", LOGIN_URL)
+            pg.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+            self._wait_past_cf(pg)
 
-            if "Just a moment" in page.title or "잠시만" in page.title:
-                log.info("🛡️ 遇到初始 Cloudflare 盾，尝试突破...")
-                page.handle_cloudflare_challenge()
-                time.sleep(5)
-
-            identifier_input = page.ele('css:input#identifier')
-            is_login_visible = identifier_input and identifier_input.is_displayed
-
-            if not is_login_visible and "login" not in page.url:
-                log.info("✅ 浏览器内未检测到登录框，似乎已经是登录状态！直接提取 Cookie。")
+            ident = pg.query_selector("input#identifier")
+            if ident is None:
+                log.info("✅ 未見到登录框（可能已是登录态），直接去后台验证…")
             else:
-                log.info("🔄 需要登录，开始执行流程...")
-                
-                if not is_login_visible:
-                    conn_btn = page.ele('text:Connexion') or page.ele('text:Login')
-                    if conn_btn:
-                        conn_btn.click()
-                        time.sleep(3)
-                        identifier_input = page.ele('css:input#identifier')
-
-                if identifier_input:
-                    for _ in range(20):
-                        if identifier_input.is_displayed: break
-                        time.sleep(0.25)
-                        
-                if identifier_input and identifier_input.is_displayed:
-                    log.info("✍️ [1/2] 正在对准账号框输入...")
-                    identifier_input.input(self.email, clear=True)
-                    time.sleep(1)
-                    
-                    next_btn = page.ele('css:button#goToPassword')
-                    if next_btn:
-                        next_btn.click()
-                        time.sleep(2) 
-                        
-                    pwd_input = page.ele('css:input#password')
-                    if pwd_input:
-                        for _ in range(20):
-                            if pwd_input.is_displayed: break
-                            time.sleep(0.25)
-
-                    if pwd_input and pwd_input.is_displayed:
-                        log.info("🔑 [2/2] 正在对准密码框输入...")
-                        pwd_input.input(self.password, clear=True)
-                        time.sleep(1)
-
-                        remember_label = page.ele('css:label[for="remember_me"]')
-                        if remember_label:
-                            try: remember_label.click()
-                            except: pass
-                        time.sleep(1)
-
-                        cf_passed = False
-                        for cf_retry in range(5):
-                            log.info(f"🛡️ [第 {cf_retry+1}/5 次] 调用浏览器官方 API 处理 CF 验证码...")
-                            page.handle_cloudflare_challenge(timeout=15)
-                            
-                            try:
-                                cf_input = page.ele('css:input[name="cf-turnstile-response"]')
-                                if cf_input:
-                                    for _ in range(10): 
-                                        if cf_input.attr("value"):
-                                            cf_passed = True
-                                            break
-                                        time.sleep(1)
-                                else:
-                                    cf_passed = True
-                            except: pass
-                                
-                            if cf_passed: break  
-
-                        if not cf_passed:
-                            log.error("❌ 致命错误：获取 CF Token 失败。")
-                            return {}
-
-                        log.info("🚀 提交表单...")
-                        submit_btn = page.ele('css:button[type="submit"]')
-                        if submit_btn:
-                            submit_btn.click()
-                        else:
-                            pwd_input.input('\n')
-                        
-                        time.sleep(8)
-                        
-                        if "Just a moment" in page.title or "잠시만" in page.title:
-                            page.handle_cloudflare_challenge()
-                            time.sleep(5)
+                log.info("✍️ [1/2] 输入账号…")
+                pg.fill("input#identifier", self.email)
+                time.sleep(0.6)
+                nxt = pg.query_selector("button#goToPassword")
+                if nxt:
+                    nxt.click()
                 else:
+                    pg.press("input#identifier", "Enter")
+                time.sleep(1.8)
+
+                log.info("🔑 [2/2] 输入密码…")
+                pg.wait_for_selector("input#password", state="visible", timeout=20000)
+                pg.fill("input#password", self.password)
+                time.sleep(0.5)
+                try:
+                    cb = pg.query_selector("input#remember_me")
+                    if cb and not cb.is_checked():
+                        cb.check()
+                except Exception:
+                    pass
+
+                if not self._solve_cap(pg):
+                    log.error("❌ 致命错误：Cap 验证码未能通过（cap-token 一直为空）。")
                     return {}
 
-            log.info("🔗 验证最终状态，前往广告后台...")
-            page.get(ADS_URL)
-            time.sleep(4)
-            
-            if "login" not in page.url:
-                log.info("✅ 成功进入广告后台！准备窃取 Cookie...")
-                cookies_dict = {}
-                for c in page.cookies:
-                    if isinstance(c, dict):
-                        if c.get('name'): cookies_dict[c['name']] = c.get('value', '')
+                log.info("🚀 提交登录表单…")
+                btn = (pg.query_selector('form button[type="submit"]')
+                       or pg.query_selector("form button:not([type])"))
+                if btn:
+                    btn.click()
+                else:
+                    pg.press("input#password", "Enter")
+                pg.wait_for_timeout(6000)
+                self._wait_past_cf(pg)
+
+                if "/login" in pg.url:
+                    body = ""
+                    try:
+                        body = pg.inner_text("body").lower()
+                    except Exception:
+                        pass
+                    if "identifiants invalides" in body:
+                        log.error("❌ 登录失败：账号或密码唔啱（Cap 已过，唔系验证码问题）。")
+                    elif "captcha" in body:
+                        log.error("❌ 登录失败：仍然被 Cap 验证码挡（token 未被接受）。")
                     else:
-                        c_name = getattr(c, 'name', '')
-                        if c_name: cookies_dict[c_name] = getattr(c, 'value', '')
-                return cookies_dict
-            else:
-                log.error("❌ 登录失败。")
+                        log.error(" 登录失败：提交后仍停留在 /login。")
+                    return {}
+
+            log.info(" 验证登录态：前往广告后台 %s", ADS_URL)
+            pg.goto(ADS_URL, wait_until="domcontentloaded", timeout=60000)
+            pg.wait_for_timeout(4000)
+            self._wait_past_cf(pg)
+            if "/login" in pg.url:
+                log.error("❌ 登录失败：访问广告后台被弹回登录页。")
                 return {}
+            log.info("✅ 成功进入广告后台！准备提取 Cookie…")
+            cookies = {}
+            for c in ctx.cookies():
+                if c.get("name"):
+                    cookies[c["name"]] = c.get("value", "")
+            log.info("🍪 提取到 %d 个 Cookie: %s", len(cookies),
+                     ", ".join(sorted(cookies))[:200])
+            return cookies
 
         except Exception as e:
             log.error(f"❌ 浏览器执行异常: {e}")
             return {}
         finally:
-            if page: page.quit()
-
-
-# ════════════════════════════════════════════════════════════════════
+            try:
+                if browser:
+                    browser.close()
+            except Exception:
+                pass
+            try:
+                if pw:
+                    pw.stop()
+            except Exception:
+                pass# ════════════════════════════════════════════════════════════════════
 # 底层 HTTP 极速挂机逻辑
 # ════════════════════════════════════════════════════════════════════
 def _get_balance(s: requests.Session) -> float:
