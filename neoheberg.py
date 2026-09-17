@@ -259,20 +259,32 @@ class NeohebergLoginBot:
                 else:
                     pg.press("input#password", "Enter")
                 pg.wait_for_timeout(6000)
-                self._wait_past_cf(pg)
+                # 提交後 CF 可能再彈盾：畀耐啲（90 秒）並定時郁下鼠標，等 JS 盾自己過
+                for _w in range(6):
+                    if self._wait_past_cf(pg, timeout=15):
+                        break
+                    try:
+                        pg.mouse.move(320 + _w * 7, 240 + _w * 5)
+                    except Exception:
+                        pass
 
                 if "/login" in pg.url:
+                    title = self._title(pg)
                     body = ""
                     try:
                         body = pg.inner_text("body").lower()
                     except Exception:
                         pass
-                    if "identifiants invalides" in body:
-                        log.error("❌ 登录失败：账号或密码唔啱（Cap 已过，唔系验证码问题）。")
+                    log.error("❌ 提交後仍然停喺 /login｜title=%r｜url=%s", title, pg.url)
+                    log.error("   body 前 220 字: %s", " ".join(body.split())[:220] or "(讀唔到 body)")
+                    if "just a moment" in title or "un instant" in title:
+                        log.error("   判定：CF 盾未過（提交後被 Cloudflare 攔住）。")
+                    elif "identifiants invalides" in body:
+                        log.error("   判定：账号或密码唔啱（Cap 已过，唔系验证码问题）。")
                     elif "captcha" in body:
-                        log.error("❌ 登录失败：仍然被 Cap 验证码挡（token 未被接受）。")
+                        log.error("   判定：仍然被 Cap 验证码挡（token 未被接受）。")
                     else:
-                        log.error(" 登录失败：提交后仍停留在 /login。")
+                        log.error("   判定：未识别（睇上面 title / body）。")
                     return {}
 
             log.info(" 验证登录态：前往广告后台 %s", ADS_URL)
