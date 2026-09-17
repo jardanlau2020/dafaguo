@@ -26,13 +26,13 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq xvfb xauth libgtk-3-0 libdbus-glib-1-2 >/dev/null
+          sudo apt-get install -y -qq xvfb xauth >/dev/null
 
-      - name: Cache Firefox runtime
+      - name: Cache Chromium (Playwright)
         uses: actions/cache@v4
         with:
-          path: ~/.cache/ruyipage
-          key: ruyipage-firefox-v1
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-v1
 
       - name: Cache AFK state (cookies)
         uses: actions/cache@v4
@@ -42,12 +42,15 @@ jobs:
           restore-keys: |
             neoheberg-state-
 
-      - name: Install python deps + Firefox runtime
+      - name: Install python deps + Chromium
         run: |
-          pip install --quiet curl_cffi ruyipage
-          python -m ruyipage install
+          pip install --quiet curl_cffi playwright
+          python -m playwright install --with-deps chromium
 
+      # 登入已經唔靠代理（真瀏覽器機房 IP 都過 CF + Cap），代理純粹係加分項：
+      # 節點死咗唔應該拖冧成個 run，所以 continue-on-error（失敗只會令 PROXY_SERVER 冇值 → 直連）。
       - name: Setup residential proxy (sing-box via NODE_LINK)
+        continue-on-error: true
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: bash ./setup_proxy.sh
@@ -61,6 +64,8 @@ jobs:
           NOTIFY_NAME: NeoHeberg-GHA
           BROWSER_WORK_DIR: ${{ github.workspace }}/browser-work
           NH_WAIT: '65'
+          NH_HEADLESS: '1'
+          NH_CAP_WAIT: '60'
           PROXY: ${{ env.PROXY_SERVER }}
         run: |
           set -o pipefail   # 貼住 python 嘅 exit code，唔好俾 tee 食咗
