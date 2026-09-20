@@ -154,6 +154,63 @@ class NeohebergLoginBot:
         except Exception:
             return ""
 
+    # ── Cap 診斷（2026-09-20）：widget 內部狀態 / 網絡事件，用嚟定案 cap-token 為何一直為空 ──
+    @staticmethod
+    def _cap_debug(pg, tag=""):
+        try:
+            info = pg.evaluate("""() => {
+                const w = document.querySelector('cap-widget');
+                if (!w) return {found: false};
+                const sr = w.shadowRoot;
+                const r = w.getBoundingClientRect();
+                const out = {found: true, token_len: ((w.token || '') + '').length,
+                             box: {x: Math.round(r.x), y: Math.round(r.y),
+                                   w: Math.round(r.width), h: Math.round(r.height)},
+                             html_len: sr ? (sr.innerHTML || '').length : 0};
+                if (sr) {
+                    out.text = (sr.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 160);
+                    const cb = sr.querySelector('button, .checkbox, [role="checkbox"], input[type="checkbox"]');
+                    if (cb) {
+                        const cr = cb.getBoundingClientRect();
+                        out.checkbox = {tag: cb.tagName, cls: (cb.className || '').slice(0, 40),
+                                        x: Math.round(cr.x), y: Math.round(cr.y),
+                                        w: Math.round(cr.width), h: Math.round(cr.height)};
+                    }
+                }
+                const inp = document.querySelector('input[name="cap-token"]');
+                out.input_found = !!inp;
+                return out;
+            }""")
+            log.info("   [CAP-DEBUG%s] %s", tag, json.dumps(info, ensure_ascii=False)[:600])
+            return info
+        except Exception as e:
+            log.warning("   [CAP-DEBUG%s] 讀取失敗: %s", tag, repr(e)[:120])
+            return None
+
+    def _click_cap_widget(self, pg, box) -> str:
+        """點 Cap widget（純點擊，冇 solver）：優先 Playwright 直接選中 shadow DOM 內嘅 checkbox
+        （Playwright 嘅 CSS 選擇器會穿透 open shadow root），失敗先退返真鼠標點座標。"""
+        for sel in ("cap-widget button", "cap-widget .checkbox",
+                    "cap-widget [role=checkbox]", "cap-widget input[type=checkbox]", "cap-widget"):
+            try:
+                pg.click(sel, timeout=4000)
+                return f"playwright:{sel}"
+            except Exception:
+                continue
+        if not box:
+            return "fail:no_box"
+        try:
+            cx = box["x"] + box["width"] / 2
+            cy = box["y"] + box["height"] / 2
+            pg.mouse.move(box["x"] + 20, box["y"] + 15)
+            time.sleep(0.35)
+            pg.mouse.move(cx, cy, steps=12)
+            time.sleep(0.25)
+            pg.mouse.click(cx, cy)
+            return "mouse:widget_center"
+        except Exception as e:
+            return f"fail:{repr(e)[:80]}"
+
     def _solve_cap(self, pg) -> bool:
         """点击 Cap widget，等佢自己跑完 PoW 并把 cap-token 填好。"""
         try:
@@ -163,6 +220,7 @@ class NeohebergLoginBot:
         if widget is None:
             log.warning("⚠️ 页面揾唔到 cap-widget（站方可能改版），照样尝试直接提交…")
             return True
+        self._cap_debug(pg, tag="[點擊前]")
         for attempt in range(1, 4):
             if self._cap_token(pg):
                 return True
@@ -175,18 +233,21 @@ class NeohebergLoginBot:
                 time.sleep(2)
                 continue
             log.info(" [第 %d/3 次] 点击 Cap 验证码 widget …", attempt)
-            try:
-                pg.mouse.move(box["x"] + 30, box["y"] + 25)
-                time.sleep(0.3)
-                pg.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
-            except Exception as e:
-                log.warning("   点击异常: %s", e)
+            log.info("   [CAP] 點擊方式: %s", self._click_cap_widget(pg, box))
             for sec in range(self.cap_wait):
                 time.sleep(1)
                 if self._cap_token(pg):
                     log.info("   ✅ %ds 拿到 cap-token", sec + 1)
                     return True
+                if sec in (5, 15, 30):
+                    self._cap_debug(pg, tag=f"[等了 {sec + 1}s]")
             log.warning("   本轮 %ds 内未拿到 cap-token，重试…", self.cap_wait)
+            self._cap_debug(pg, tag=f"[第 {attempt} 次點擊後仍無 token]")
+        try:
+            pg.screenshot(path="cap_fail.png", full_page=True)
+            log.info("   [CAP] 已保存失敗截圖 cap_fail.png")
+        except Exception as e:
+            log.warning("   [CAP] 截圖失敗: %s", repr(e)[:80])
         return bool(self._cap_token(pg))
 
     # ---------------------------- 主流程 ----------------------------
@@ -217,6 +278,40 @@ class NeohebergLoginBot:
                 timezone_id="Europe/Paris",
             )
             pg = ctx.new_page()
+
+            # ── 診斷（2026-09-20）：Cap 相關網絡請求 + JS 錯誤，用嚟查 cap-token 為何一直為空 ──
+            _cap_kw = ("cap", "challenge", "redeem", "trycap")
+
+            def _on_response(resp):
+                try:
+                    u = resp.url
+                    if any(k in u for k in _cap_kw):
+                        log.info("   [NET] %s %s %s", resp.status, resp.request.method, u[:130])
+                except Exception:
+                    pass
+
+            def _on_failed(req):
+                try:
+                    u = req.url
+                    if any(k in u for k in _cap_kw):
+                        log.warning("   [NET-FAIL] %s %s", req.failure, u[:130])
+                except Exception:
+                    pass
+
+            def _on_pageerror(err):
+                log.warning("   [JS-ERROR] %s", str(err)[:200])
+
+            def _on_console(msg):
+                try:
+                    if msg.type in ("error", "warning"):
+                        log.info("   [CONSOLE:%s] %s", msg.type, msg.text[:200])
+                except Exception:
+                    pass
+
+            pg.on("response", _on_response)
+            pg.on("requestfailed", _on_failed)
+            pg.on("pageerror", _on_pageerror)
+            pg.on("console", _on_console)
 
             log.info("🔗 访问登录页: %s", LOGIN_URL)
             pg.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)

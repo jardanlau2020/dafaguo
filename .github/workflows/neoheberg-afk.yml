@@ -77,5 +77,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: afk-log
-          path: afk.log
+          path: |
+            afk.log
+            *.png
+          if-no-files-found: warn
           retention-days: 3
