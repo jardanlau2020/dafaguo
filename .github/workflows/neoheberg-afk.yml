@@ -59,6 +59,9 @@ jobs:
         env:
           EMAIL: ${{ secrets.NH_EMAIL }}
           PASSWORD: ${{ secrets.NH_PASSWORD }}
+          # 2026-09-20 新增：Cap 服務商端點自己都被 Cloudflare 擋（403 cf-mitigated），
+          # 機房 IP 冇可能用瀏覽器登入。用戶貼一份 Cookie 入呢個 secret 即可跳過登入。
+          NH_COOKIE: ${{ secrets.NH_COOKIE }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           NOTIFY_NAME: NeoHeberg-GHA

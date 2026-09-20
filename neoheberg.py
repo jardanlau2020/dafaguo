@@ -516,7 +516,35 @@ def report(state: dict, balance: float, force: bool = False) -> None:
     send_tg(msg)
     log.info("TG 报告: 余额=%s 今日收益=%s", balance, earned)
 
+def parse_cookie_seed(raw: str) -> dict:
+    """解析 NH_COOKIE secret（`k=v; k=v` 格式）成 cookie dict。"""
+    out = {}
+    for part in (raw or "").split(";"):
+        if "=" in part:
+            k, v = part.strip().split("=", 1)
+            if k:
+                out[k] = v
+    return out
+
+
 def run_browser_extractor(state: dict) -> requests.Session:
+    # ── 2026-09-20 定案：Cap 服務端本身被 Cloudflare 擋 ──────────────────
+    # 實測（NAS 直連 curl）：POST https://trycap.axel-l.fr/6a74828fe6/challenge
+    #   → HTTP 403 + `cf-mitigated: challenge` + <title>Just a moment...</title>
+    # 即係話「驗證碼服務商嘅 API 自己被 CF 託管挑戰擋住」。瀏覽器入面，cap-widget
+    # 對該 endpoint 嘅 cross-origin POST 因為 CF 回嘅挑戰頁冇 Access-Control-Allow-Origin
+    # 而直接 CORS 失敗（run 35494907320 / 35496596633 / 35496911871 全部一樣：
+    # [NET-FAIL] net::ERR_FAILED .../challenge + [JS-ERROR] Failed to fetch）。
+    # 走代理（Luxvps TUIC）同直連（Azure runner）結果一樣 → 唔係換 IP 可以解決，
+    # 機房 IP 由瀏覽器自動登入呢條路原理上封死。
+    # 對策：用戶由自己瀏覽器貼一份 Cookie 入 secret NH_COOKIE，直接餵底層協議，
+    # 完全跳過登入關卡（AFK 迴圈本來就只用 cookie，唔需要每次重新登入）。
+    seed = parse_cookie_seed(os.environ.get("NH_COOKIE", ""))
+    if seed:
+        log.info("🔑 使用 NH_COOKIE secret 種子 Cookie（%d 個）", len(seed))
+        state["saved_cookies"] = seed
+        save_state(state)
+        return make_session(state)
     log.warning("⚠️ 呼叫浏览器先锋队提取全新 Cookie...")
     bot = NeohebergLoginBot()
     fresh_cookies = bot.run()
@@ -526,9 +554,13 @@ def run_browser_extractor(state: dict) -> requests.Session:
         log.info("✅ 已拿到新鲜 Cookie，即将交接给底层挂机协议！")
         return make_session(state)
     else:
-        msg = "❌ 浏览器获取 Cookie 失败！不再死等，向面板报告任务异常退出。"
+        msg = ("❌ <b>NeoHeberg AFK 無法登入</b>\n"
+               "原因：驗證碼服務商端點 <code>trycap.axel-l.fr</code> 自己都被 Cloudflare 擋"
+               "（403 cf-mitigated: challenge）→ cap-widget 嘅 POST /challenge 撞 CORS → "
+               "cap-token 永遠為空，機房 IP 冇可能自動登入（直連／代理實測一樣）。\n"
+               "對策：由自己瀏覽器抄一份 Cookie，貼入 secret <code>NH_COOKIE</code>，即可跳過呢關。")
         send_tg(msg)
-        sys.exit(1)  
+        sys.exit(1)
 
 def main() -> None:
     state = load_state()
