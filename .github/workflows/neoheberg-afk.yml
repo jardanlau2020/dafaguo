@@ -17,9 +17,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350   # 每輪 ~72s × 100 輪 ≈ 2h，留足緩衝
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
@@ -29,13 +29,13 @@ jobs:
           sudo apt-get install -y -qq xvfb xauth >/dev/null
 
       - name: Cache Chromium (Playwright)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: playwright-chromium-${{ runner.os }}-v1
 
       - name: Cache AFK state (cookies)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ./browser-work
           key: neoheberg-state-${{ github.run_id }}
@@ -77,7 +77,7 @@ jobs:
 
       - name: Upload log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: afk-log
           path: |
