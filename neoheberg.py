@@ -539,26 +539,40 @@ def run_browser_extractor(state: dict) -> requests.Session:
     # 機房 IP 由瀏覽器自動登入呢條路原理上封死。
     # 對策：用戶由自己瀏覽器貼一份 Cookie 入 secret NH_COOKIE，直接餵底層協議，
     # 完全跳過登入關卡（AFK 迴圈本來就只用 cookie，唔需要每次重新登入）。
+    # ── 2026-09-24 更新：登入關卡已經通返，種子要驗證 + 自動退回瀏覽器 ──────
+    # 今日實測：真瀏覽器（+代理）2 秒就過 CF 盾同自架 Cap，即係 09-20 嗰個
+    # 「trycap 端點被 CF 擋」已經唔再成立。所以種子（NH_COOKIE）唔再係唯一出路：
+    # 種子失效就自動退回真瀏覽器登入，唔好再好似 run 35964033696 咁 1 分鐘就死。
+    # 順序：secret 種子（快，先驗）→ 真瀏覽器登入（慢，但係真嘅）→ 兩條都死先報紅。
     seed = parse_cookie_seed(os.environ.get("NH_COOKIE", ""))
     if seed:
         log.info("🔑 使用 NH_COOKIE secret 種子 Cookie（%d 個）", len(seed))
         state["saved_cookies"] = seed
         save_state(state)
-        return make_session(state)
+        s = make_session(state)
+        try:
+            bal = _get_balance(s)
+            log.info("✅ 種子 Cookie 有效（余额 %.4f），跳過登入關卡。", bal)
+            return s
+        except PermissionError:
+            log.warning("⚠️ 種子 Cookie 已被伺服器淘汰（session 過期），自動退回真瀏覽器登入…")
+        except Exception as e:
+            log.warning("⚠️ 用種子驗證時遇到異常(%s): %s，照樣試真瀏覽器登入…", type(e).__name__, e)
+
     log.warning("⚠️ 呼叫浏览器先锋队提取全新 Cookie...")
     bot = NeohebergLoginBot()
     fresh_cookies = bot.run()
     if fresh_cookies:
         state["saved_cookies"] = fresh_cookies
         save_state(state)
-        log.info("✅ 已拿到新鲜 Cookie，即将交接给底层挂机协议！")
+        log.info("✅ 已拿到新鲜 Cookie（%d 個），即将交接给底层挂机协议！", len(fresh_cookies))
         return make_session(state)
     else:
         msg = ("❌ <b>NeoHeberg AFK 無法登入</b>\n"
-               "原因：驗證碼服務商端點 <code>trycap.axel-l.fr</code> 自己都被 Cloudflare 擋"
-               "（403 cf-mitigated: challenge）→ cap-widget 嘅 POST /challenge 撞 CORS → "
-               "cap-token 永遠為空，機房 IP 冇可能自動登入（直連／代理實測一樣）。\n"
-               "對策：由自己瀏覽器抄一份 Cookie，貼入 secret <code>NH_COOKIE</code>，即可跳過呢關。")
+               "兩條路都死：① secret <code>NH_COOKIE</code> 種子 Cookie 已被伺服器淘汰；"
+               "② 真瀏覽器自動登入（過 CF 盾 + Cap）都失敗。\n"
+               "對策：由自己瀏覽器抄一份新 Cookie，貼入 secret <code>NH_COOKIE</code>；"
+               "或睇 log 內 Cap/CF 診斷行（[NET] / [JS-ERROR]）判斷係邊一關卡死。")
         send_tg(msg)
         sys.exit(1)
 
