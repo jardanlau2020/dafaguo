@@ -314,6 +314,9 @@ list_accounts() {
 # 收益信号 = 当日日志里“历劫归来”行（每完成一轮广告、余额入账即记录）。
 # 超过 DAFAGUO_NO_GAIN_MINUTES（默认 5）分钟没有新收益 → 自动 restart 该账号。
 NO_GAIN_MINUTES=${DAFAGUO_NO_GAIN_MINUTES:-5}
+# 看护熔断：单账号每小时最多自动重启次数。超过则停止自动重启并告警，
+# 防止账号被封禁/站点改版导致脚本永远无收益时，每分钟无限重启触发站点风控。
+MAX_RESTARTS_PER_HOUR=${DAFAGUO_WATCH_MAX_RESTARTS:-5}
 
 # 返回账号当日日志最后一次“历劫归来”的 epoch 秒；无记录返回 0
 last_gain_epoch() {
@@ -329,8 +332,45 @@ last_gain_epoch() {
   echo 0
 }
 
+# 日志清理：删除超过 LOG_RETENTION_DAYS 天的旧日志，防止磁盘被日志撑满。
+LOG_RETENTION_DAYS=${DAFAGUO_LOG_RETENTION_DAYS:-7}
+cleanup_old_logs() {
+  local marker="$MULTI_HOME/.last-log-cleanup" today
+  today=$(date +%F)
+  # 每天最多执行一次，避免每分钟看护都去扫盘
+  if [[ -f "$marker" && "$(cat "$marker")" == "$today" ]]; then
+    return 0
+  fi
+  [[ -d "$ACCOUNTS_DIR" ]] && find "$ACCOUNTS_DIR" -type f -name '*.log' -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+  find "$MULTI_HOME" -maxdepth 1 -type f -name '*.log' -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
+  printf '%s\n' "$today" > "$marker" 2>/dev/null || true
+}
+
+# 看护重启计数：每小时最多 MAX_RESTARTS_PER_HOUR 次。
+# 用 "小时窗口起始 epoch:次数" 单行文件记录，避免频繁写盘。
+restart_budget_ok() {
+  local dir=$1 now window_start count file
+  file="$dir/state/watch-restart"
+  now=$(date +%s)
+  window_start=$(( now - now % 3600 ))   # 当前整点小时窗口
+  count=0
+  if [[ -f "$file" ]]; then
+    IFS=: read -r file_window file_count < "$file" || true
+    if [[ "$file_window" == "$window_start" && "$file_count" =~ ^[0-9]+$ ]]; then
+      count=$file_count
+    fi
+  fi
+  mkdir -p "$dir/state"
+  if (( count >= MAX_RESTARTS_PER_HOUR )); then
+    return 1   # 超出预算，拒绝重启
+  fi
+  printf '%s:%s\n' "$window_start" "$(( count + 1 ))" > "$file"
+  return 0
+}
+
 watch_account() {
   local name=${1:-} dir pid_file pid log last now age
+  cleanup_old_logs
   require_account "$name"
   dir=$(account_dir "$name")
   pid_file="$dir/run.pid"
@@ -341,6 +381,11 @@ watch_account() {
   fi
   read -r pid < "$pid_file" || true
   if ! ([[ ${pid:-} =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null); then
+    if ! restart_budget_ok "$dir"; then
+      printf 'watch[%s]: 进程已死，但已达每小时自动重启上限(%d)，暂停自恢复，请手动检查\n' \
+        "$name" "$MAX_RESTARTS_PER_HOUR"
+      return 0
+    fi
     printf 'watch[%s]: 进程已死 (PID %s)，自动重启\n' "$name" "${pid:-unknown}"
     rm -f "$pid_file"
     start_account "$name"
@@ -353,7 +398,19 @@ watch_account() {
   fi
   now=$(date +%s)
   age=$(( now - last ))
+  # 时钟/时区异常防护：日志里是今天写入的记录，正常 age 应在 0~24h 内。
+  # 出现负数(时钟回拨/时区变更)或超过 24h(时区被改导致历史时间戳错位)都视为不可信，跳过判断，
+  # 避免误触发重启风暴。
+  if (( age < 0 || age > 86400 )); then
+    printf 'watch[%s]: 收益时间戳异常(age=%ss，可能时钟/时区变动)，本轮跳过\n' "$name" "$age"
+    return 0
+  fi
   if (( age >= NO_GAIN_MINUTES * 60 )); then
+    if ! restart_budget_ok "$dir"; then
+      printf 'watch[%s]: 已 %d 分钟无收益，但已达每小时自动重启上限(%d)，暂停重启，请手动检查账号状态\n' \
+        "$name" "$(( age / 60 ))" "$MAX_RESTARTS_PER_HOUR"
+      return 0
+    fi
     printf 'watch[%s]: 已 %d 分钟无收益(超过 %d 分钟)，自动重启\n' \
       "$name" "$(( age / 60 ))" "$NO_GAIN_MINUTES"
     restart_account "$name"

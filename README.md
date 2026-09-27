@@ -136,6 +136,16 @@ apt install -y xvfb
 | `BROWSER_WORK_DIR` | 否 | 工作目录，默认 `/home/browser/browser-work` |
 | `BROWSER_USER_DATA_DIR` | 否 | 指定 Firefox profile 目录（保留登录态）|
 
+### 多账号 / 看护调优
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `DAFAGUO_NO_GAIN_MINUTES` | `5` | 连续多少分钟无收益触发自动重启 |
+| `DAFAGUO_WATCH_MAX_RESTARTS` | `5` | **单账号每小时最多自动重启次数**，超出即熔断暂停自动重启（防止账号被封/站点改版导致无限重启触发风控）|
+| `DAFAGUO_LOG_RETENTION_DAYS` | `7` | 日志保留天数，超期自动删除（每天执行一次）|
+
+手动触发看护：`multi-account.sh watch`，安装每分钟看护 cron：`multi-account.sh install-watch-timers`。
+
 ## 日志样例
 
 ```
