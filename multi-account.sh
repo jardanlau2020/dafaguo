@@ -23,9 +23,9 @@ usage() {
   multi-account.sh set-proxy <账号名>               # 清除账号代理
   multi-account.sh status [账号名]
   multi-account.sh list                    # 列出全部账号
-  multi-account.sh watch [账号名...]        # 收益看护：N 分钟(默认5)无收益自动重启
-  multi-account.sh install-watch-timers    # 配置每分钟收益看护 cron
-  multi-account.sh remove-watch-timers     # 关闭收益看护 cron
+  multi-account.sh watch [账号名...]        # 进程看护：进程意外死亡时自动拉起
+  multi-account.sh install-watch-timers    # 配置每分钟进程看护 cron
+  multi-account.sh remove-watch-timers     # 关闭进程看护 cron
   multi-account.sh install-timers
   multi-account.sh remove-timers
 EOF
@@ -310,27 +310,10 @@ list_accounts() {
   return 0
 }
 
-# ═══════════ 收益看护：N 分钟无收益自动重启 ═══════════
-# 收益信号 = 当日日志里“历劫归来”行（每完成一轮广告、余额入账即记录）。
-# 超过 DAFAGUO_NO_GAIN_MINUTES（默认 5）分钟没有新收益 → 自动 restart 该账号。
-NO_GAIN_MINUTES=${DAFAGUO_NO_GAIN_MINUTES:-5}
-# 看护熔断：单账号每小时最多自动重启次数。超过则停止自动重启并告警，
-# 防止账号被封禁/站点改版导致脚本永远无收益时，每分钟无限重启触发站点风控。
+# ═══════════ 进程看护：进程意外死亡时自动拉起 ═══════════
+# 重启熔断：单账号每小时最多自动重启次数。超过则停止自动重启并告警，
+# 防止进程反复崩溃时每分钟无限重启。
 MAX_RESTARTS_PER_HOUR=${DAFAGUO_WATCH_MAX_RESTARTS:-5}
-
-# 返回账号当日日志最后一次“历劫归来”的 epoch 秒；无记录返回 0
-last_gain_epoch() {
-  local dir=$1 log last ts
-  log="$dir/logs/$(date +%F).log"
-  [[ -f "$log" ]] || { echo 0; return 0; }
-  last=$(grep -F '历劫归来' "$log" | tail -1)
-  [[ -n "$last" ]] || { echo 0; return 0; }
-  ts=$(printf '%s\n' "$last" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' | head -1)
-  if [[ -n "$ts" ]] && date -d "$ts" +%s 2>/dev/null; then
-    return 0
-  fi
-  echo 0
-}
 
 # 日志清理：删除超过 LOG_RETENTION_DAYS 天的旧日志，防止磁盘被日志撑满。
 LOG_RETENTION_DAYS=${DAFAGUO_LOG_RETENTION_DAYS:-7}
@@ -369,7 +352,7 @@ restart_budget_ok() {
 }
 
 watch_account() {
-  local name=${1:-} dir pid_file pid log last now age
+  local name=${1:-} dir pid_file pid
   cleanup_old_logs
   require_account "$name"
   dir=$(account_dir "$name")
@@ -391,32 +374,7 @@ watch_account() {
     start_account "$name"
     return 0
   fi
-  last=$(last_gain_epoch "$dir")
-  if (( ! last )); then
-    printf 'watch[%s]: 今日日志尚无“历劫归来”收益记录，跳过\n' "$name"
-    return 0
-  fi
-  now=$(date +%s)
-  age=$(( now - last ))
-  # 时钟/时区异常防护：日志里是今天写入的记录，正常 age 应在 0~24h 内。
-  # 出现负数(时钟回拨/时区变更)或超过 24h(时区被改导致历史时间戳错位)都视为不可信，跳过判断，
-  # 避免误触发重启风暴。
-  if (( age < 0 || age > 86400 )); then
-    printf 'watch[%s]: 收益时间戳异常(age=%ss，可能时钟/时区变动)，本轮跳过\n' "$name" "$age"
-    return 0
-  fi
-  if (( age >= NO_GAIN_MINUTES * 60 )); then
-    if ! restart_budget_ok "$dir"; then
-      printf 'watch[%s]: 已 %d 分钟无收益，但已达每小时自动重启上限(%d)，暂停重启，请手动检查账号状态\n' \
-        "$name" "$(( age / 60 ))" "$MAX_RESTARTS_PER_HOUR"
-      return 0
-    fi
-    printf 'watch[%s]: 已 %d 分钟无收益(超过 %d 分钟)，自动重启\n' \
-      "$name" "$(( age / 60 ))" "$NO_GAIN_MINUTES"
-    restart_account "$name"
-  else
-    printf 'watch[%s]: 正常，最近收益于 %d 分钟前\n' "$name" "$(( age / 60 ))"
-  fi
+  printf 'watch[%s]: 运行正常 (PID %s)\n' "$name" "$pid"
 }
 
 watch_batch() {
@@ -445,7 +403,7 @@ install_watch_cron() {
   local cronline="* * * * * DAFAGUO_MULTI_HOME=$MULTI_HOME bash \"$SCRIPT_DIR/multi-account.sh\" watch >> \"$MULTI_HOME/cron.log\" 2>&1 $tag"
   ( crontab -l 2>/dev/null | grep -vF "$tag"; printf '%s\n' "$cronline" ) | crontab -
   if crontab -l | grep -qF "$tag"; then
-    printf '已配置每分钟收益看护 cron (无收益 %d 分钟自动重启)\n' "$NO_GAIN_MINUTES"
+    printf '已配置每分钟进程看护 cron (进程死亡自动拉起，每小时最多 %d 次)\n' "$MAX_RESTARTS_PER_HOUR"
   else
     printf 'cron 写入失败，可手动执行: %s watch\n' "$SCRIPT_DIR/multi-account.sh"
   fi
