@@ -33,6 +33,14 @@ GREEN=$'\033[32m'; RED=$'\033[31m'; YELLOW=$'\033[33m'; CYAN=$'\033[36m'; NC=$'\
 info() { echo "${GREEN}[*]${NC} $*"; }
 warn() { echo "${YELLOW}[!]${NC} $*"; }
 err()  { echo "${RED}[x]${NC} $*"; }
+
+# 可选严格模式：NEOHEBERG_STRICT=1 时启用 set -u，尽早暴露变量名拼写错误。
+# 默认不启用 —— 本脚本大量读取 env 文件里的可选配置（EMAIL/PASSWORD/TG_BOT_TOKEN/PROXY 等），
+# 用户未配置时这些变量本就未定义，开启 set -u 会导致脚本在读取处直接退出。
+if [ "${NEOHEBERG_STRICT:-0}" = "1" ]; then
+    set -u
+    warn "严格模式已启用（set -u）"
+fi
 ok()   { echo "${GREEN}[✓]${NC} $*"; }
 
 
@@ -274,6 +282,50 @@ do_install_system_pkgs() {
     return 0
 }
 
+# 下载 get-pip.py 并做完整性校验。
+# 供应链防护：下载内容必须通过 Python 语法编译检查（篡改/劫持的产物几乎必然不是合法 Python），
+# 这是不依赖易失效硬编码 hash 的稳健做法。若运维显式提供 NEOHEBERG_GETPIP_SHA256
+# 则额外做 SHA256 强校验。
+fetch_get_pip() {
+    local pyver=${1:-} gp=${2:-/tmp/neoheberg-get-pip.py} url expect actual
+    if [[ -n "$pyver" && "$pyver" =~ ^3\.[6-9]$ ]]; then
+        url="https://bootstrap.pypa.io/pip/${pyver}/get-pip.py"
+    else
+        url="https://bootstrap.pypa.io/get-pip.py"
+    fi
+    curl -fsSL --max-time 60 "$url" -o "$gp" || { err "get-pip.py 下载失败"; return 1; }
+
+    # 强校验（可选）：运维提供期望 SHA256 时必须匹配
+    if [[ -n "${NEOHEBERG_GETPIP_SHA256:-}" ]]; then
+        actual=$(sha256sum "$gp" | awk '{print $1}')
+        expect=$(printf '%s' "$NEOHEBERG_GETPIP_SHA256" | tr 'A-Z' 'a-z' | tr -d '[:space:]')
+        if [[ "$actual" != "$expect" ]]; then
+            err "get-pip.py SHA256 校验失败（期望 ${expect:0:16}… 实得 ${actual:0:16}…），已中止"
+            rm -f "$gp"
+            return 1
+        fi
+        ok "get-pip.py SHA256 校验通过"
+    fi
+
+    # 兜底校验：必须非空，且是可编译的 Python 脚本
+    if [[ ! -s "$gp" ]]; then
+        err "get-pip.py 内容为空，已中止"
+        rm -f "$gp"
+        return 1
+    fi
+    if ! python3 -c 'import sys,py_compile,tempfile,shutil,os
+src=sys.argv[1]
+try:
+    compile(open(src,"rb").read(), src, "exec")
+except SyntaxError as e:
+    sys.exit(1)' "$gp" 2>/dev/null; then
+        err "get-pip.py 完整性校验失败（内容不是合法 Python），已中止"
+        rm -f "$gp"
+        return 1
+    fi
+    return 0
+}
+
 # 创建虚拟环境：优先用 venv，老系统 ensurepip 缺失时用 get-pip.py 引导
 ensure_venv() {
     mkdir -p "$APP_DIR"; chmod 700 "$APP_DIR"
@@ -299,10 +351,7 @@ ensure_venv() {
     local pyver gp
     pyver=$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "3.9")
     gp="/tmp/neoheberg-get-pip.py"
-    case "$pyver" in
-        3.6|3.7|3.8|3.9) curl -fsSL "https://bootstrap.pypa.io/pip/${pyver}/get-pip.py" -o "$gp" ;;
-        *)               curl -fsSL "https://bootstrap.pypa.io/get-pip.py" -o "$gp" ;;
-    esac || { err "get-pip.py 下载失败"; return 1; }
+    fetch_get_pip "$pyver" "$gp" || return 1
 
     if [ -x "$VENV/bin/python" ]; then
         "$VENV/bin/python" "$gp" --no-warn-script-location >/dev/null 2>&1 || { err "pip 安装失败"; return 1; }
@@ -330,10 +379,7 @@ do_install_py_deps() {
             local gp="/tmp/neoheberg-get-pip.py"
             local pyver
             pyver=$("$VENV/bin/python" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "3.9")
-            case "$pyver" in
-                3.6|3.7|3.8|3.9) curl -fsSL "https://bootstrap.pypa.io/pip/${pyver}/get-pip.py" -o "$gp" ;;
-                *)               curl -fsSL "https://bootstrap.pypa.io/get-pip.py" -o "$gp" ;;
-            esac || { err "get-pip.py 下载失败"; return 1; }
+            fetch_get_pip "$pyver" "$gp" || return 1
             "$VENV/bin/python" "$gp" --no-warn-script-location >/dev/null 2>&1 || { err "venv 内 pip 安装失败"; return 1; }
             rm -f "$gp"
             pip="$VENV/bin/pip"

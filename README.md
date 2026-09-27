@@ -135,6 +135,8 @@ apt install -y xvfb
 | `PROXY` | 否 | 如 `socks5://user:pass@host:port` |
 | `BROWSER_WORK_DIR` | 否 | 工作目录，默认 `/home/browser/browser-work` |
 | `BROWSER_USER_DATA_DIR` | 否 | 指定 Firefox profile 目录（保留登录态）|
+| `NEOHEBERG_STRICT` | 否 | 设 `1` 启用 `set -u` 严格模式，尽早暴露变量名拼写错误（默认关闭）|
+| `NEOHEBERG_GETPIP_SHA256` | 否 | get-pip.py 的期望 SHA256，提供后启用强校验；不提供则用 Python 语法编译做兜底校验 |
 
 ### 多账号 / 看护调优
 
