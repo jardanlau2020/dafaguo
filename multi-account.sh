@@ -5,7 +5,15 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MULTI_HOME=${DAFAGUO_MULTI_HOME:-"$HOME/.local/share/dafaguo-multi"}
 ACCOUNTS_DIR="$MULTI_HOME/accounts"
 SYSTEMD_DIR=${DAFAGUO_SYSTEMD_USER_DIR:-"$HOME/.config/systemd/user"}
-PYTHON_BIN=${DAFAGUO_PYTHON_BIN:-python3}
+# 解释器优先级：显式指定 > 脚本同目录的 venv > 系统 python3
+# （venv 优先是因为 ruyipage 只装在 venv 里，用系统 python3 会报"缺少依赖"）
+PYTHON_BIN=${DAFAGUO_PYTHON_BIN:-}
+if [ -z "$PYTHON_BIN" ]; then
+  for _cand in "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/.venv/bin/python"; do
+    if [ -x "$_cand" ]; then PYTHON_BIN="$_cand"; break; fi
+  done
+fi
+PYTHON_BIN=${PYTHON_BIN:-python3}
 APP="$SCRIPT_DIR/neoheberg.py"
 
 usage() {
@@ -231,7 +239,9 @@ watch_batch() {
 install_watch_cron() {
   local tag="# DAFAGUO-V1-WATCH"
   local cronline="* * * * * DAFAGUO_MULTI_HOME=$MULTI_HOME bash \"$SCRIPT_DIR/multi-account.sh\" watch >> \"$MULTI_HOME/cron.log\" 2>&1 $tag"
-  ( crontab -l 2>/dev/null | grep -vF "$tag"; printf '%s\n' "$cronline" ) | crontab -
+  # 注意：crontab 为空时 grep -vF 无匹配行、返回 1，
+  # 在 set -euo pipefail 下会中止子 shell 导致写入静默失败，必须 || true。
+  ( crontab -l 2>/dev/null | grep -vF "$tag" || true; printf '%s\n' "$cronline" ) | crontab -
   if crontab -l | grep -qF "$tag"; then
     printf '已配置每分钟进程看护 cron (进程死亡自动拉起，每小时最多 %d 次)\n' "$MAX_RESTARTS_PER_HOUR"
   else
