@@ -53,6 +53,11 @@ except Exception:
     pass
 
 STATE_FILE = os.path.join(WORK_DIR, "neoheberg_afk_state.json")
+# 每日完成标记：文件名带日期，跨天自动失效，无需人工清理。
+# 用途：刷满 100 条后进程会正常退出，但 multi-account.sh 的每分钟看护 cron
+# 会把"已干净退出"误判成"意外死亡"从而反复拉起，既空转又重复推送 TG 战报。
+# 写这个标记后，启动与看护都会先检查它，避免重启。
+DONE_MARKER = os.path.join(WORK_DIR, f"done-{time.strftime('%Y-%m-%d')}")
 
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID", "")
@@ -276,6 +281,12 @@ def main():
 
     page = None
     try:
+        # 今日已完成则直接退出：不启动 Firefox、不登录、不重复推送 TG 战报。
+        if os.path.exists(DONE_MARKER):
+            log.info("ℹ️ 今日 100 条广告已刷满（完成标记存在），跳过本次启动。")
+            try: os.remove(STATE_FILE)
+            except: pass
+            sys.exit(0)
         log.info("🤖 启动 Firefox 终结者版机器人...")
         opts = FirefoxOptions()
         # 自动定位 ruyipage 下载的 Firefox 运行时（版本号会变，不硬编码）
@@ -341,6 +352,13 @@ def main():
                         send_tg(msg)
                         try: os.remove(STATE_FILE)
                         except: pass
+                        # 写完成标记：告知看护 cron「这是正常收工，别再拉起」
+                        try:
+                            with open(DONE_MARKER, "w") as f:
+                                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} 余额 {bal:.6f} 今日 +{earned:.6f}\n")
+                            os.chmod(DONE_MARKER, 0o600)
+                        except Exception as e:
+                            log.warning(f"写完成标记失败（看护可能重复拉起）: {e}")
                         sys.exit(0)
                         
                     # 寻找播放按钮

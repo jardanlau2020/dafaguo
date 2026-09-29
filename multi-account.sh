@@ -202,6 +202,14 @@ watch_account() {
   fi
   read -r pid < "$pid_file" || true
   if ! ([[ ${pid:-} =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null); then
+    # 今日 100 条已刷满：neoheberg.py 是正常收工退出的，别把它当"意外死亡"拉起，
+    # 否则每分钟空转一次 Firefox，并重复推送 TG 战报。
+    local done_marker="$dir/state/profiles/done-$(date +%F)"
+    if [[ -f "$done_marker" ]]; then
+      printf 'watch[%s]: 今日广告已刷满，正常收工，不再拉起\n' "$name"
+      rm -f "$pid_file"
+      return 0
+    fi
     if ! restart_budget_ok "$dir"; then
       printf 'watch[%s]: 进程已死，但已达每小时自动重启上限(%d)，暂停自恢复，请手动检查\n' \
         "$name" "$MAX_RESTARTS_PER_HOUR"
