@@ -34,7 +34,7 @@ env:
   UPSTREAM_SHA: f0fb7414d0898715834163af45deb01e8e82440c   # 2026-09-29 fix: 刷满100条后被看护cron反复拉起
   UPSTREAM_NEOHEBERG_SHA256: 206309abdd245f7286d7b2069e7629e2982df86449ca9d39940d14dcdd5adb9c
   MAX_ROUNDS: '3'
-  WALL_CAP_S: '690'      # neoheberg.py 進程硬上限（11.5 分鐘）；job 上限 20 分鐘
+  WALL_CAP_S: '600'      # neoheberg.py 進程硬上限（10 分鐘）；job 上限 20 分鐘
 
 jobs:
   journey:
@@ -53,8 +53,7 @@ jobs:
           echo "上游 repo   : $UPSTREAM_REPO"
           echo "上游 commit : $UPSTREAM_SHA  (pin 死，唔會跟 branch 郁)"
           echo "廣告輪數上限: $MAX_ROUNDS 輪，之後 kill"
-          echo "進程硬上限  : ${WALL_CAP_S}s，job timeout 20 分鐘"
-          echo "TG 狀態     : TG_BOT_TOKEN=${TG_BOT_TOKEN:-<unset>} TG_CHAT_ID=${TG_CHAT_ID:-<unset>} → 零 TG 推送"
+          echo "進程硬上限  : ${WALL_CAP_S}s，job timeout 20 分鐘"          echo "TG 狀態     : TG_BOT_TOKEN=${TG_BOT_TOKEN:-<unset>} TG_CHAT_ID=${TG_CHAT_ID:-<unset>} → 零 TG 推送"
           echo "我哋 repo HEAD: $(git rev-parse HEAD)"
           echo "我哋 repo 工作區改動: $(git status --porcelain | wc -l) 行（應該係 0）"
 
@@ -128,8 +127,9 @@ jobs:
           cat > "$RUNNER_TEMP/nh_balance_probe.py" <<'PYEOF'
           #!/usr/bin/env python3
           # 獨立餘額探針：用我哋 repo 現有 NH_COOKIE 種子 cookie 直接讀面板，
-          # 唔經瀏覽器、唔經上游腳本。cookie 過期照樣印出結果，唔會令 workflow 失敗。
-          import os, re, sys
+          # 唔經瀏覽器、唔經上游腳本。行我哋主流程同一條路（落 NODE_LINK 代理），
+          # cookie 過期／被 CF 擋照樣印出結果，唔會令 workflow 失敗。
+          import os, re, sys, time
           from curl_cffi import requests
 
           ADS_URL = "https://dash.neoheberg.fr/shop/ads"
@@ -146,6 +146,7 @@ jobs:
           def main():
               tag = sys.argv[1] if len(sys.argv) > 1 else "?"
               raw = os.environ.get("NH_COOKIE", "")
+              proxy = (os.environ.get("PROXY") or "").strip()
               if not raw.strip():
                   print(f"BALANCE_PROBE[{tag}]=n/a (no NH_COOKIE seed)")
                   return
@@ -155,21 +156,32 @@ jobs:
               except Exception as e:
                   print(f"BALANCE_PROBE[{tag}]=error (cookie set {type(e).__name__})")
                   return
-              try:
-                  r = s.get(ADS_URL, timeout=30)
-              except Exception as e:
-                  print(f"BALANCE_PROBE[{tag}]=error ({type(e).__name__})")
-                  return
-              if "/login" in r.url or "Connexion" in r.text[:600].replace(" ", ""):
-                  print(f"BALANCE_PROBE[{tag}]=stale (cookie 已過期, HTTP {r.status_code})")
-                  return
-              clean = re.sub(r'<[^>]+>', ' ', r.text)
-              m = re.search(r'Solde\s*([\d,\.]+)\s*coins', clean, re.IGNORECASE) \
-                  or re.search(r'([\d,\.]+)\s*coins', clean, re.IGNORECASE)
-              if not m:
-                  print(f"BALANCE_PROBE[{tag}]=unknown (HTTP {r.status_code}, 未匹配到余额)")
-                  return
-              print(f"BALANCE_PROBE[{tag}]={float(m.group(1).replace(',', '.')):.4f}")
+              kwargs = {}
+              if proxy:
+                  kwargs["proxies"] = {"http": proxy, "https": proxy}
+              print(f"BALANCE_PROBE[{tag}]_via={'proxy ' + proxy if proxy else 'direct'}")
+              last = None
+              for attempt in range(1, 4):
+                  try:
+                      r = s.get(ADS_URL, timeout=20, **kwargs)
+                  except Exception as e:
+                      last = f"error ({type(e).__name__})"
+                      print(f"BALANCE_PROBE[{tag}] attempt{attempt}: {last}")
+                      time.sleep(5)
+                      continue
+                  if "/login" in r.url or "Connexion" in r.text[:600].replace(" ", ""):
+                      last = f"stale (cookie 已過期, HTTP {r.status_code})"
+                      break
+                  clean = re.sub(r'<[^>]+>', ' ', r.text)
+                  m = re.search(r'Solde\s*([\d,\.]+)\s*coins', clean, re.IGNORECASE) \
+                      or re.search(r'([\d,\.]+)\s*coins', clean, re.IGNORECASE)
+                  if m:
+                      last = f"{float(m.group(1).replace(',', '.')):.4f}"
+                      break
+                  last = f"unknown (HTTP {r.status_code}, 未匹配到余额)"
+                  print(f"BALANCE_PROBE[{tag}] attempt{attempt}: {last}")
+                  time.sleep(5)
+              print(f"BALANCE_PROBE[{tag}]={last}")
 
           if __name__ == "__main__":
               main()
@@ -228,6 +240,76 @@ jobs:
           exit 0
           SHEOF
           chmod +x "$RUNNER_TEMP/nh_journey_watch.sh"
+
+          cat > "$RUNNER_TEMP/nh_ff_preflight.sh" <<'SHEOF'
+          #!/usr/bin/env bash
+          # 診斷用：按 ruyipage 一樣嘅啟動參數親手開 Firefox，唔吞 stderr（ruyipage 會 DEVNULL
+          # 佢自己嗰個，所以上游 log 見唔到 Firefox 講咩），並試三種模式：
+          #   plain     : root + HOME=/root，冇額外 env（最忠於上游 start.sh 嘅跑法）
+          #   mozns     : root + MOZ_DISABLE_*_SANDBOX=1（上游 install.sh 自檢用嘅同一套）
+          #   runneru   : 以 runner 用戶跑（root 身份某啲沙盒/權限環境會擋 Firefox）
+          # 只係診斷，唔會令 job 紅；verdict 行畀外層寫入 GITHUB_ENV 決定正式跑法。
+          set -uo pipefail
+
+          FF=$(ls -d /root/.cache/ruyipage/browsers/firefox-*/firefox/firefox 2>/dev/null | tail -1)
+          if [ -z "$FF" ]; then
+            echo "PREFLIGHT: 搵唔到 firefox binary"
+            echo "PREFLIGHT_VERDICT=none_ok"
+            exit 0
+          fi
+          echo "PREFLIGHT: FF=$FF"
+          echo "PREFLIGHT: runtime=$(du -sh "$(dirname "$FF")" 2>/dev/null | cut -f1) ldd_missing=$(ldd "$FF" 2>/dev/null | grep -c 'not found')"
+          echo "PREFLIGHT: dev_shm=$(df -h /dev/shm 2>/dev/null | tail -1 | awk '{print $2}') apparmor_userns=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)"
+          echo "PREFLIGHT: id=$(id -u)/$(id -un) runner_uid=$(id -u runner 2>/dev/null || echo none)"
+
+          try_variant() {
+            tag="$1"; port="$2"; disp="$3"; moz="$4"; asuser="$5"
+            prof="/tmp/ffpre_${tag}"
+            rm -rf "$prof"; mkdir -p "$prof"; chmod 777 "$prof"
+            printf 'user_pref("remote.prefs.recommended", true);\nuser_pref("marionette.enabled", true);\n' > "$prof/user.js"
+            chmod 666 "$prof/user.js"
+            Xvfb "$disp" -ac -screen 0 1280x800x24 >/dev/null 2>&1 &
+            xpid=$!
+            sleep 2
+            log="/tmp/ffpre_${tag}.log"
+            if [ "$asuser" = "runner" ]; then
+              argv=(sudo -u runner env "HOME=/home/runner" "PATH=$PATH" "DISPLAY=$disp")
+            else
+              argv=(env "HOME=/root" "PATH=$PATH" "DISPLAY=$disp")
+            fi
+            [ "$moz" = "1" ] && argv+=("MOZ_DISABLE_CONTENT_SANDBOX=1" "MOZ_DISABLE_GMP_SANDBOX=1" "MOZ_DISABLE_RDD_SANDBOX=1" "MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1" "MOZ_DISABLE_GPU_SANDBOX=1")
+            "${argv[@]}" "$FF" "--remote-debugging-port=$port" --no-remote --marionette --profile "$prof" > "$log" 2>&1 &
+            fpid=$!
+            ok=no; i=0
+            for i in $(seq 1 45); do
+              if (exec 3<>/dev/tcp/127.0.0.1/$port) 2>/dev/null; then ok=yes; break; fi
+              kill -0 "$fpid" 2>/dev/null || { echo "PREFLIGHT[$tag]: 進程已死 @${i}s"; break; }
+              sleep 1
+            done
+            echo "PREFLIGHT[$tag]: port_open=$ok after ${i}s (user=$asuser moz_vars=$moz)"
+            echo "---- PREFLIGHT[$tag] Firefox 輸出（tail 25，濾走 ALSA/Fontconfig 噪音）----"
+            grep -v "ALSA lib\|libEGL warning\|Fontconfig\|^$" "$log" 2>/dev/null | tail -25
+            echo "---- PREFLIGHT[$tag] 完 ----"
+            kill -9 "$fpid" 2>/dev/null
+            sleep 1
+            pkill -9 -f "profile /tmp/ffpre_${tag}" 2>/dev/null
+            kill -9 "$xpid" 2>/dev/null
+            sleep 1
+            [ "$ok" = "yes" ]
+          }
+
+          if try_variant plain 29991 :91 0 root; then
+            echo "PREFLIGHT_VERDICT=plain_ok"
+          elif try_variant mozns 29992 :92 1 root; then
+            echo "PREFLIGHT_VERDICT=moz_ok"
+          elif try_variant runneru 29993 :93 1 runner; then
+            echo "PREFLIGHT_VERDICT=runner_ok"
+          else
+            echo "PREFLIGHT_VERDICT=none_ok"
+          fi
+          exit 0
+          SHEOF
+          chmod +x "$RUNNER_TEMP/nh_ff_preflight.sh"
 
           cat > "$RUNNER_TEMP/nh_journey_summary.py" <<'PYEOF'
           #!/usr/bin/env python3
@@ -296,10 +378,34 @@ jobs:
 
           ls -la "$RUNNER_TEMP"/nh_*.py "$RUNNER_TEMP"/nh_journey_watch.sh
 
+      - name: Firefox preflight (診斷：睇得到 Firefox 自己嘅 stderr)
+        run: |
+          set -uo pipefail
+          sudo bash "$RUNNER_TEMP/nh_ff_preflight.sh" 2>&1 | tee "$RUNNER_TEMP/preflight.log"
+          PF="$RUNNER_TEMP/preflight.log"
+          if grep -q "PREFLIGHT_VERDICT=plain_ok" "$PF"; then
+            echo "NH_RUNAS=root"   >> "$GITHUB_ENV"
+            echo "NH_MOZ=0"        >> "$GITHUB_ENV"
+            echo "✅ preflight：plain（root、無額外 env）可連上，正式跑法同上游一致"
+          elif grep -q "PREFLIGHT_VERDICT=moz_ok" "$PF"; then
+            echo "NH_RUNAS=root"   >> "$GITHUB_ENV"
+            echo "NH_MOZ=1"        >> "$GITHUB_ENV"
+            echo "⚠️ preflight：plain 連唔上，但加 MOZ_DISABLE_*_SANDBOX=1 就 OK（同上游 install.sh 自檢同一套）"
+          elif grep -q "PREFLIGHT_VERDICT=runner_ok" "$PF"; then
+            echo "NH_RUNAS=runner" >> "$GITHUB_ENV"
+            echo "NH_MOZ=1"        >> "$GITHUB_ENV"
+            echo "⚠️ preflight：root 起唔到，要用 runner 身份跑"
+          else
+            echo "NH_RUNAS=root"   >> "$GITHUB_ENV"
+            echo "NH_MOZ=0"        >> "$GITHUB_ENV"
+            echo "❌ preflight：三種模式都連唔上 127.0.0.1，下面正式跑大概率一樣，log 就係證據"
+          fi
+
       - name: Balance BEFORE (independent, NH_COOKIE seed, no browser)
         continue-on-error: true
         env:
           NH_COOKIE: ${{ secrets.NH_COOKIE }}
+          PROXY: ${{ env.PROXY_SERVER }}
         run: |
           python "$RUNNER_TEMP/nh_balance_probe.py" before | tee "$RUNNER_TEMP/balance_before.txt"
 
@@ -312,14 +418,32 @@ jobs:
           set -uo pipefail
           UP="$RUNNER_TEMP/upstream"
           LOG="$RUNNER_TEMP/journey.log"
+          WORK="$RUNNER_TEMP/nh-work"
+          MOZ=()
+          if [ "${NH_MOZ:-0}" = "1" ]; then
+            MOZ=("MOZ_DISABLE_CONTENT_SANDBOX=1" "MOZ_DISABLE_GMP_SANDBOX=1" "MOZ_DISABLE_RDD_SANDBOX=1"
+                 "MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1" "MOZ_DISABLE_GPU_SANDBOX=1")
+          fi
+          runas="${NH_RUNAS:-root}"
+          echo "▶ 正式跑法：runas=$runas moz_vars=${NH_MOZ:-0}（由 preflight 診斷決定）"
           # secrets 缺席（例如未設 NH_EMAIL）唔應該令 step 直接爆 unbound variable：
           # 照傳空字串落去，由上游自己印「❌ 未配置 EMAIL 或 PASSWORD」再 exit 1。
           # 刻意唔傳 TG_BOT_TOKEN / TG_CHAT_ID / NOTIFY_NAME：
           # 上游 send_tg() 冇兩隻 env 就直接 return（上游 neoheberg.py:73-82）→ 零 TG 推送。
-          sudo env HOME=/root PATH="$PATH" \
-               EMAIL="${EMAIL:-}" PASSWORD="${PASSWORD:-}" PROXY="${PROXY:-}" \
-               BROWSER_WORK_DIR="$RUNNER_TEMP/nh-work" \
-               bash "$RUNNER_TEMP/nh_journey_watch.sh" "$UP" "$LOG" "$MAX_ROUNDS" "$WALL_CAP_S"
+          if [ "$runas" = "runner" ]; then
+            # runner 身份跑：先要畀佢行得入 /root 讀到 runtime（上游硬編碼 glob 喺 /root 下）
+            sudo chmod 755 /root
+            sudo chmod -R a+rX /root/.cache/ruyipage
+            sudo -u runner env HOME=/home/runner PATH="$PATH" ${MOZ[@]+"${MOZ[@]}"} \
+                 EMAIL="${EMAIL:-}" PASSWORD="${PASSWORD:-}" PROXY="${PROXY:-}" \
+                 BROWSER_WORK_DIR="$WORK" \
+                 bash "$RUNNER_TEMP/nh_journey_watch.sh" "$UP" "$LOG" "$MAX_ROUNDS" "$WALL_CAP_S"
+          else
+            sudo env HOME=/root PATH="$PATH" ${MOZ[@]+"${MOZ[@]}"} \
+                 EMAIL="${EMAIL:-}" PASSWORD="${PASSWORD:-}" PROXY="${PROXY:-}" \
+                 BROWSER_WORK_DIR="$WORK" \
+                 bash "$RUNNER_TEMP/nh_journey_watch.sh" "$UP" "$LOG" "$MAX_ROUNDS" "$WALL_CAP_S"
+          fi
           rc=$?
           echo "--- watchdog rc=$rc，log 大小: $(wc -l < "$LOG" 2>/dev/null || echo 0) 行 ---"
 
@@ -328,6 +452,7 @@ jobs:
         continue-on-error: true
         env:
           NH_COOKIE: ${{ secrets.NH_COOKIE }}
+          PROXY: ${{ env.PROXY_SERVER }}
         run: |
           python "$RUNNER_TEMP/nh_balance_probe.py" after | tee "$RUNNER_TEMP/balance_after.txt"
 
