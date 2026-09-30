@@ -113,7 +113,8 @@ jobs:
           # 而測試進程亦要以 root 跑。呢度唔改上游任何一行 code，只配合佢嘅路徑假設。
           sudo env HOME=/root PATH="$PATH" python -m ruyipage install
           sudo env HOME=/root PATH="$PATH" python -m ruyipage doctor
-          sudo ls -d /root/.cache/ruyipage/browsers/firefox-*/firefox/firefox
+          # 注意：glob 一定要由 root 自己展開（runner 讀唔到 /root），所以包一層 bash -c
+          sudo bash -c 'ls -d /root/.cache/ruyipage/browsers/firefox-*/firefox/firefox'
 
       - name: Setup residential proxy (sing-box via NODE_LINK)
         continue-on-error: true
