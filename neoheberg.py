@@ -77,9 +77,7 @@ log = logging.getLogger("neoheberg-afk")
 def send_tg(text: str) -> None:
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         return
-    # 多台机器区分：配了 NOTIFY_NAME 就加一行标识头
-    if NOTIFY_NAME:
-        text = f"🖥️ <b>{NOTIFY_NAME}</b>\n{text}"
+    # 多台機器區分（NOTIFY_NAME）已併入 tg_head() 表頭，唔再另開一行水印
     try:
         data = json.dumps({"chat_id": TG_CHAT_ID, "text": text, "parse_mode": "HTML"}).encode()
         req = urllib.request.Request(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
@@ -87,6 +85,46 @@ def send_tg(text: str) -> None:
         urllib.request.urlopen(req, timeout=15)
     except Exception as e:
         pass
+
+
+def now_local() -> str:
+    """UTC+8 當地時間 MM-DD HH:MM（獨立 helper，方便日後重用）"""
+    return datetime.now(TZ_BJ).strftime("%m-%d %H:%M")
+
+
+def tg_head(status: str) -> str:
+    """瘦身通知表頭：🎮 服務（節點名）｜ MM-DD HH:MM ｜ 狀態"""
+    svc = f"NeoHeberg（{NOTIFY_NAME}）" if NOTIFY_NAME else "NeoHeberg"
+    return f"🎮 {svc} ｜ {now_local()} ｜ {status}"
+
+
+def msg_report(balance: float, earned: float, rounds: int, first: bool = False) -> str:
+    """上線／掛機心跳：表頭一行 ＋ 餘額收益一行"""
+    return (f"{tg_head('✅ 已上線' if first else '✅ 掛機中')}\n"
+            f"💰 {balance:.4f} 🪙 · 今日 +{earned:.4f} 🪙（{rounds} 輪）")
+
+
+def msg_dayend(bal_end: Optional[float], earned: Optional[float], rounds: int) -> str:
+    """今日額度刷滿收工：表頭一行 ＋ 結算一行"""
+    head = tg_head("✅ 今日刷滿 100/100")
+    if bal_end is None or earned is None:
+        return f"{head}\n⚠️ 收盤餘額讀取失敗，今日收益未能結算"
+    return f"{head}\n💰 收盤 {bal_end:.4f} 🪙 · 今日 +{earned:.4f} 🪙（{rounds} 輪）"
+
+
+def msg_login_failed() -> str:
+    """兩條登入路都死：表頭一行 ＋ 對策一行"""
+    return (f"{tg_head('❌ 無法登入')}\n"
+            f"💡 種子 NH_COOKIE 已失效、真瀏覽器登入亦失敗；抄新 Cookie 貼入 secret NH_COOKIE"
+            f"（Cap/CF 診斷見 log）")
+
+
+def msg_zero_gain(zs: int, balance: Optional[float]) -> str:
+    """連續兌換未入賬告警：表頭一行 ＋ 原因一行"""
+    bal = balance if balance is not None else 0.0
+    return (f"{tg_head(f'⚠️ 連續 {zs} 次兌換未入賬')}\n"
+            f"💰 {bal:.4f} 🪙 · 廣告結算鏈路可能異常（非腳本故障）")
+
 
 def load_state() -> dict:
     try:
@@ -511,8 +549,7 @@ def report(state: dict, balance: float, force: bool = False) -> None:
     state["last_report"] = now
     save_state(state)
     earned = (balance - state.get("day_start_balance")) if state.get("day_start_balance") is not None else 0.0
-    ts = datetime.now(TZ_BJ).strftime("%Y-%m-%d %H:%M 北京时间")
-    msg = (f"🪄 NeoHeberg AFK\n📅 {ts}\n\n💰 <b>余额</b>: {balance:.4f} 🪙\n📈 <b>今日收益</b>: +{earned:.4f} 🪙（今日 {state.get('day_rounds', 0)} 轮）")
+    msg = msg_report(balance, earned, state.get("day_rounds", 0), first=force)
     send_tg(msg)
     log.info("TG 报告: 余额=%s 今日收益=%s", balance, earned)
 
@@ -568,12 +605,7 @@ def run_browser_extractor(state: dict) -> requests.Session:
         log.info("✅ 已拿到新鲜 Cookie（%d 個），即将交接给底层挂机协议！", len(fresh_cookies))
         return make_session(state)
     else:
-        msg = ("❌ <b>NeoHeberg AFK 無法登入</b>\n"
-               "兩條路都死：① secret <code>NH_COOKIE</code> 種子 Cookie 已被伺服器淘汰；"
-               "② 真瀏覽器自動登入（過 CF 盾 + Cap）都失敗。\n"
-               "對策：由自己瀏覽器抄一份新 Cookie，貼入 secret <code>NH_COOKIE</code>；"
-               "或睇 log 內 Cap/CF 診斷行（[NET] / [JS-ERROR]）判斷係邊一關卡死。")
-        send_tg(msg)
+        send_tg(msg_login_failed())
         sys.exit(1)
 
 def main() -> None:
@@ -659,17 +691,7 @@ def main() -> None:
                     state["last_balance"] = bal_end
                     save_state(state)
                 earned = (bal_end - state["day_start_balance"]) if (bal_end is not None and state.get("day_start_balance") is not None) else None
-                if earned is not None:
-                    msg = (f"🎉 NeoHeberg 今日挂机结束\n\n"
-                           f"✅ 广告额度：100/100 已刷满\n"
-                           f"🔄 今日轮次：{state.get('day_rounds', 0)} 轮\n"
-                           f"💰 收盘余额：{bal_end:.4f} 🪙\n"
-                           f"📈 今日收益：+{earned:.4f} 🪙")
-                else:
-                    msg = (f"🎉 NeoHeberg 今日挂机结束\n\n"
-                           f"✅ 广告额度：100/100 已刷满\n"
-                           f"🔄 今日轮次：{state.get('day_rounds', 0)} 轮\n"
-                           f"⚠️ 余额读取失败，收益未能结算")
+                msg = msg_dayend(bal_end, earned, state.get("day_rounds", 0))
                 log.info(msg.replace("\n", " | "))
                 send_tg(msg)
                 sys.exit(0)
@@ -710,7 +732,7 @@ def main() -> None:
                 log.warning("第 %d 次兑换未入账（HTTP 200 但余额未增，当前 %.4f），累计 %d 次",
                             state.get("rounds", 0), (cur if cur is not None else 0.0), zs)
                 if zs in (10, 30, 60):
-                    send_tg(f"⚠️ NeoHeberg 已连续 {zs} 次兑换未入账\n💰 当前余额：{(cur if cur is not None else 0.0):.4f} 🪙\n（广告结算链路可能异常，非脚本故障）")
+                    send_tg(msg_zero_gain(zs, cur))
                 time.sleep(RETRY_COOLDOWN)
 
         except PermissionError:
