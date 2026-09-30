@@ -489,7 +489,12 @@ Description=dafaguo 多账号任务：$name
 Type=forking
 ExecStart=$quoted_script start $name
 ExecStop=$quoted_script stop $name
-RemainAfterExit=yes
+# 注意: 绝对不能加 RemainAfterExit=yes
+# multi-account.sh start 会把挂机进程放到后台、父进程立刻退出，
+# Type=forking 下 systemd 认为服务已启动。加上 RemainAfterExit 会让它
+# 永远停在 active(exited)，而 timer 在自己触发的单元仍是 active 时
+# 不会重新排期 —— 结果就是每天只触发一次，第二天起再也不自动启动
+# (表现为 list-timers 里 NEXT/LEFT 全是 "-", Trigger: n/a)。
 EOF
     cat > "$SYSTEMD_DIR/dafaguo-$name.timer" <<EOF
 [Unit]
