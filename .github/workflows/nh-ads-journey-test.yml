@@ -63,13 +63,28 @@ jobs:
           set -euo pipefail
           UP="$RUNNER_TEMP/upstream"
           rm -rf "$UP" && mkdir -p "$UP"
-          curl -fsSL -o "$RUNNER_TEMP/upstream.tar.gz" \
-            "https://codeload.github.com/${UPSTREAM_REPO}/tar.gz/${UPSTREAM_SHA}"
-          tar -xzf "$RUNNER_TEMP/upstream.tar.gz" -C "$UP" --strip-components=1
-          echo "--- 落咗嘅上游檔案 ---"
+          git -C "$UP" init -q
+          git -C "$UP" remote add origin "https://github.com/${UPSTREAM_REPO}.git"
+          # 用 git 自己嘅物件 hash 做 pin 校驗（比外層 sha256 更硬）：
+          # fetch 完 rev-parse HEAD 一定要等于 UPSTREAM_SHA，否則即停。
+          if git -C "$UP" fetch -q --depth 1 origin "${UPSTREAM_SHA}"; then
+            git -C "$UP" checkout -q FETCH_HEAD
+          else
+            echo "[fetch] 直接 fetch 指定 SHA 失敗（可能唔再可達），改為取 main 歷史再 checkout"
+            git -C "$UP" fetch -q origin main
+            git -C "$UP" checkout -q "${UPSTREAM_SHA}"
+          fi
+          HEAD_SHA=$(git -C "$UP" rev-parse HEAD)
+          echo "--- pin 校驗 ---"
+          echo "要求 commit : $UPSTREAM_SHA"
+          echo "實際 checkout: $HEAD_SHA"
+          [ "$HEAD_SHA" = "$UPSTREAM_SHA" ] || { echo "❌ 攞到嘅唔係指定 commit，停手"; exit 1; }
+          git -C "$UP" log -1 --format='%H %ci %s'
+          echo "--- 落咗嘅上游檔案（工作區）---"
           ls -la "$UP"
-          echo "--- pin 校驗：neoheberg.py sha256 ---"
-          echo "$UPSTREAM_NEOHEBERG_SHA256  $UP/neoheberg.py" | sha256sum -c -
+          echo "--- neoheberg.py sha256（記錄用）---"
+          echo "實際: $(sha256sum "$UP/neoheberg.py" | cut -d' ' -f1)"
+          echo "參考: $UPSTREAM_NEOHEBERG_SHA256"
           echo "--- 入口／依賴自我檢查 ---"
           grep -n "from ruyipage\|/root/.cache/ruyipage\|while True:\|def main" "$UP/neoheberg.py" | head
 
@@ -321,10 +336,13 @@ jobs:
           set -uo pipefail
           LOG="$RUNNER_TEMP/journey.log"
           [ -f "$LOG" ] || touch "$LOG"
-          # 證據抄一份入 workspace 相對路徑，方便 upload-artifact 打包
           mkdir -p ./journey-evidence
           cp "$LOG" ./journey-evidence/journey.log
           cp "$RUNNER_TEMP"/balance_*.txt ./journey-evidence/ 2>/dev/null || true
+          if [ ! -f "$RUNNER_TEMP/nh_journey_summary.py" ]; then
+            echo "⚠️ harness 未準備好（前面有 step 失敗），只出 log"
+            exit 0
+          fi
           python "$RUNNER_TEMP/nh_journey_summary.py" "$LOG" "$RUNNER_TEMP/journey_summary.txt" \
             | tee -a "$GITHUB_STEP_SUMMARY"
           cp "$RUNNER_TEMP/journey_summary.txt" ./journey-evidence/journey_summary.txt
