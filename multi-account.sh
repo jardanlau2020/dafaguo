@@ -456,10 +456,29 @@ set_proxy() {
 }
 
 status_one() {
-  local name=$1 dir pid_file pid schedule proxy_line proxy_val
+  local name=$1 dir pid_file pid schedule proxy_line proxy_val timer_unit next
   require_account "$name"
   dir=$(account_dir "$name")
   schedule=$(<"$dir/schedule")
+  # 同时显示 systemd 实际排的下次触发时间。
+  # 只显示 schedule 文件里的配置值会让人误判「改了没生效」——
+  # 实际是否排上期要看 timer。两者不一致时以 timer 为准并给出提示。
+  timer_unit="dafaguo-$name.timer"
+  next=""
+  if command -v systemctl >/dev/null 2>&1; then
+    next=$(systemctl --user show "$timer_unit" -p NextElapseUSecRealtime --value 2>/dev/null)
+  fi
+  local sched_txt="$schedule"
+  if [[ -n "$next" && "$next" != "n/a" ]]; then
+    sched_txt="$schedule（下次 $next）"
+    if [[ "$next" != *"${schedule}"* ]]; then
+      sched_txt="$schedule ⚠ timer 实际为 $next"
+    fi
+  elif [[ -n "${next:-}" ]]; then
+    sched_txt="$schedule ⚠ 定时器未排期，请执行 install-timers"
+  else
+    sched_txt="$schedule（未安装定时器）"
+  fi
   proxy_val=""
   if [[ -f "$dir/account.env" ]]; then
     proxy_line=$(grep -E '^[[:space:]]*PROXY[[:space:]]*=' "$dir/account.env" 2>/dev/null | tail -1) || true
@@ -477,12 +496,12 @@ status_one() {
     read -r pid < "$pid_file" || true
     if [[ ${pid:-} =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
       printf '%s：\033[32m运行中\033[0m，PID %s，每日 %s，代理 %s\n' \
-        "$name" "$pid" "$schedule" "${proxy_val:-(无)}"
+        "$name" "$pid" "$sched_txt" "${proxy_val:-(无)}"
       return
     fi
     rm -f "$pid_file"
   fi
-  printf '%s：\033[31m未运行\033[0m，每日 %s，代理 %s\n' "$name" "$schedule" "${proxy_val:-(无)}"
+  printf '%s：\033[31m未运行\033[0m，每日 %s，代理 %s\n' "$name" "$sched_txt" "${proxy_val:-(无)}"
 }
 
 status_accounts() {
