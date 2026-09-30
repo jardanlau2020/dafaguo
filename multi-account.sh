@@ -152,6 +152,10 @@ list_accounts() {
 # 重启熔断：单账号每小时最多自动重启次数。超过则停止自动重启并告警，
 # 防止进程反复崩溃时每分钟无限重启。
 MAX_RESTARTS_PER_HOUR=${DAFAGUO_WATCH_MAX_RESTARTS:-5}
+# 卡死检测阈值（分钟）：进程 PID 还活着，但日志长时间没有任何新增内容。
+# 正常挂机每 1-2 分钟就会写一行「历劫归来！第 N 轮完成」，超过这个分钟数没动静
+# 基本可以断定卡死（例如浏览器会话已死却在空转报错）。设 0 关闭该检测。
+STUCK_MINUTES=${DAFAGUO_STUCK_MINUTES:-10}
 
 # 日志清理：删除超过 LOG_RETENTION_DAYS 天的旧日志，防止磁盘被日志撑满。
 LOG_RETENTION_DAYS=${DAFAGUO_LOG_RETENTION_DAYS:-7}
@@ -220,6 +224,31 @@ watch_account() {
     start_account "$name"
     return 0
   fi
+  # ---- 卡死检测 ----
+  # 走到这里说明进程 PID 活着。但「活着」不等于「在干活」：
+  # 浏览器会话已经死掉、Python 只是在空转报错时，kill -0 依然成功，
+  # 上面那条「进程已死」分支永远不会触发，脚本会一直假装正常。
+  # 判据：最新日志的 mtime 距今超过 STUCK_MINUTES 分钟（正常 1-2 分钟必有新行）。
+  if (( STUCK_MINUTES > 0 )); then
+    local latest_log log_age
+    latest_log=$(ls -t "$dir"/logs/*.log 2>/dev/null | head -1)
+    if [[ -n "$latest_log" ]]; then
+      log_age=$(( ( $(date +%s) - $(stat -c %Y "$latest_log" 2>/dev/null || echo 0) ) / 60 ))
+      if (( log_age >= STUCK_MINUTES )); then
+        if ! restart_budget_ok "$dir"; then
+          printf 'watch[%s]: 日志已 %d 分钟无更新（疑似卡死），但已达每小时重启上限(%d)，需人工检查\n' \
+            "$name" "$log_age" "$MAX_RESTARTS_PER_HOUR"
+          return 0
+        fi
+        printf 'watch[%s]: 进程存活但日志已 %d 分钟无更新，判定卡死，自动重启\n' "$name" "$log_age"
+        stop_account "$name" >/dev/null 2>&1 || true
+        rm -f "$pid_file"
+        start_account "$name"
+        return 0
+      fi
+    fi
+  fi
+
   printf 'watch[%s]: 运行正常 (PID %s)\n' "$name" "$pid"
 }
 

@@ -321,6 +321,11 @@ def main():
         send_tg(f"🚀 <b>NeoHeberg 挂机启动</b>\n💰 原始分数: {bal:.2f} 分\n正在通过浏览器前台物理过盾连刷...")
 
         stuck_counter = 0
+        # 连续异常计数：WebSocket / 浏览器会话这类故障，进程会一直活着空转报错，
+        # 而看护 cron 只看 PID 是否存活，永远不会拉起它。
+        # 达到阈值就主动退出，交给看护 cron 重新拉起一个干净实例。
+        consec_errors = 0
+        MAX_CONSEC_ERRORS = int(os.environ.get("NH_MAX_CONSEC_ERRORS", "20"))
         while True:
             try:
                 curr_url = page.url or ""
@@ -477,8 +482,16 @@ def main():
                         stuck_counter = 0
                     time.sleep(3)
                     
+                consec_errors = 0   # 跑到这里说明本轮循环正常跑完，计数清零
             except Exception as e:
-                log.error(f"⚠️ 挂机循环抛出异常: {e}")
+                consec_errors += 1
+                if consec_errors >= MAX_CONSEC_ERRORS:
+                    log.error(f"❌ 连续 {consec_errors} 次异常，判定卡死，退出交给看护 cron 重启")
+                    log.error(f"   最后异常: {e}")
+                    log.error("   若是 WebSocket 断连，通常是长连接被对端掐断，重启即可恢复")
+                    try: os.remove(STATE_FILE)
+                    except: pass
+                    sys.exit(1)
                 time.sleep(5)
                 
     except Exception as e:
