@@ -261,6 +261,7 @@ jobs:
           echo "PREFLIGHT: runtime=$(du -sh "$(dirname "$FF")" 2>/dev/null | cut -f1) ldd_missing=$(ldd "$FF" 2>/dev/null | grep -c 'not found')"
           echo "PREFLIGHT: dev_shm=$(df -h /dev/shm 2>/dev/null | tail -1 | awk '{print $2}') apparmor_userns=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)"
           echo "PREFLIGHT: id=$(id -u)/$(id -un) runner_uid=$(id -u runner 2>/dev/null || echo none)"
+          echo "PREFLIGHT: XDG_RUNTIME_DIR(env)=${XDG_RUNTIME_DIR:-<unset>} owner=$(stat -c '%U' "${XDG_RUNTIME_DIR:-/nonexistent}" 2>/dev/null || echo n/a)"
 
           try_variant() {
             tag="$1"; port="$2"; disp="$3"; moz="$4"; asuser="$5"
@@ -273,9 +274,14 @@ jobs:
             sleep 2
             log="/tmp/ffpre_${tag}.log"
             if [ "$asuser" = "runner" ]; then
-              argv=(sudo -u runner env "HOME=/home/runner" "PATH=$PATH" "DISPLAY=$disp")
+              mkdir -p /tmp/xdg-runner; chown runner:runner /tmp/xdg-runner; chmod 700 /tmp/xdg-runner
+              argv=(sudo -u runner env "HOME=/home/runner" "PATH=$PATH" "DISPLAY=$disp" "XDG_RUNTIME_DIR=/tmp/xdg-runner")
             else
-              argv=(env "HOME=/root" "PATH=$PATH" "DISPLAY=$disp")
+              # 關鍵：root 身份跑 Firefox 時，XDG_RUNTIME_DIR 若指向 runner 擁有嘅 dir
+              # （runner image 預設 /run/user/1001），Firefox 會硬性拒絕啟動：
+              # "Running Firefox as root in a regular user's session is not supported."
+              mkdir -p /root/.xdg; chmod 700 /root/.xdg
+              argv=(env "HOME=/root" "PATH=$PATH" "DISPLAY=$disp" "XDG_RUNTIME_DIR=/root/.xdg")
             fi
             [ "$moz" = "1" ] && argv+=("MOZ_DISABLE_CONTENT_SANDBOX=1" "MOZ_DISABLE_GMP_SANDBOX=1" "MOZ_DISABLE_RDD_SANDBOX=1" "MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1" "MOZ_DISABLE_GPU_SANDBOX=1")
             "${argv[@]}" "$FF" "--remote-debugging-port=$port" --no-remote --marionette --profile "$prof" > "$log" 2>&1 &
@@ -434,12 +440,15 @@ jobs:
             # runner 身份跑：先要畀佢行得入 /root 讀到 runtime（上游硬編碼 glob 喺 /root 下）
             sudo chmod 755 /root
             sudo chmod -R a+rX /root/.cache/ruyipage
-            sudo -u runner env HOME=/home/runner PATH="$PATH" ${MOZ[@]+"${MOZ[@]}"} \
+            sudo mkdir -p /tmp/xdg-runner && sudo chown runner:runner /tmp/xdg-runner && sudo chmod 700 /tmp/xdg-runner
+            sudo -u runner env HOME=/home/runner PATH="$PATH" "XDG_RUNTIME_DIR=/tmp/xdg-runner" ${MOZ[@]+"${MOZ[@]}"} \
                  EMAIL="${EMAIL:-}" PASSWORD="${PASSWORD:-}" PROXY="${PROXY:-}" \
                  BROWSER_WORK_DIR="$WORK" \
                  bash "$RUNNER_TEMP/nh_journey_watch.sh" "$UP" "$LOG" "$MAX_ROUNDS" "$WALL_CAP_S"
           else
-            sudo env HOME=/root PATH="$PATH" ${MOZ[@]+"${MOZ[@]}"} \
+            # root 身份一定要配返自己擁有嘅 XDG_RUNTIME_DIR，否則 Firefox 直接拒絕啟動
+            sudo mkdir -p /root/.xdg && sudo chmod 700 /root/.xdg
+            sudo env HOME=/root PATH="$PATH" "XDG_RUNTIME_DIR=/root/.xdg" ${MOZ[@]+"${MOZ[@]}"} \
                  EMAIL="${EMAIL:-}" PASSWORD="${PASSWORD:-}" PROXY="${PROXY:-}" \
                  BROWSER_WORK_DIR="$WORK" \
                  bash "$RUNNER_TEMP/nh_journey_watch.sh" "$UP" "$LOG" "$MAX_ROUNDS" "$WALL_CAP_S"
