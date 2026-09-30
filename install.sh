@@ -1232,8 +1232,9 @@ menu_multi() {
         echo "  [8] 安装每日定时（systemd 用户定时器）"
         echo "  [9] 移除每日定时"
         echo "  [10] 查看日志（选账号）"
+        echo "  [11] 修改每日启动时间"
         echo "  [0] 返回"
-        printf "请选择 [0-10]: "
+        printf "请选择 [0-11]: "
         read -r c || continue
         case "$c" in
             1) menu_multi_add; rc=$? ;;
@@ -1280,6 +1281,20 @@ menu_multi() {
                 fi
                 ;;
             0) return 0 ;;
+            11)
+                printf "要修改的账号名: "
+                read -r name || name=""
+                [ -n "$name" ] || { err "未输入账号名"; }
+                if [ -n "$name" ]; then
+                    printf "新的每日启动时间 (HH:MM，如 08:30): "
+                    read -r s || s=""
+                    if [ -z "$s" ]; then
+                        err "未输入时间"
+                    else
+                        DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" set-schedule "$name" "$s"
+                    fi
+                fi
+                ;;
             *) err "无效选择" ;;
         esac
         echo ""

@@ -26,6 +26,7 @@ usage() {
   multi-account.sh restart [账号名...]     # 重启（不给名字则全部）
   multi-account.sh set-proxy <账号名> <代理地址>  # 设置账号代理：socks5://user:pass@host:port
   multi-account.sh set-proxy <账号名>               # 清除账号代理
+  multi-account.sh set-schedule <账号名> <HH:MM>     # 修改每日自动启动时间，自动重建定时器
   multi-account.sh status [账号名]
   multi-account.sh list                    # 列出全部账号
   multi-account.sh watch [账号名...]        # 进程看护：进程意外死亡时自动拉起
@@ -398,6 +399,30 @@ stop_account() {
   printf '已停止账号：%s\n' "$name"
 }
 
+set_schedule() {
+  local name=${1:-} schedule=${2:-} dir old
+  require_account "$name"
+  valid_time "$schedule" || fail '时间格式必须为 HH:MM（00:00 至 23:59）'
+  dir=$(account_dir "$name")
+  old=$(<"$dir/schedule")
+  if [[ "$old" == "$schedule" ]]; then
+    printf '账号 %s 的每日启动时间已经是 %s，未做修改\n' "$name" "$schedule"
+  else
+    printf '%s\n' "$schedule" > "$dir/schedule"
+    chmod 600 "$dir/schedule"
+    printf '账号 %s 每日启动时间: %s → %s\n' "$name" "$old" "$schedule"
+  fi
+  # 必须重建并重启 timer：OnCalendar 是启动时解析的，
+  # 只 enable --now 对已在运行的 timer 不会重新应用新的日历表达式。
+  install_timers >/dev/null
+  if systemctl --user restart "dafaguo-$name.timer" 2>/dev/null; then
+    local next; next=$(systemctl --user show "dafaguo-$name.timer" -p NextElapseUSecRealtime --value 2>/dev/null)
+    printf '定时器已更新，下次触发: %s\n' "${next:-（已生效，稍后可用 list-timers 查看）}"
+  else
+    warn '定时器重启失败，若时间未生效请执行: multi-account.sh install-timers'
+  fi
+}
+
 set_proxy() {
   local name=${1:-} proxy=${2:-} dir env_file line tmp found=0
   require_account "$name"
@@ -542,6 +567,7 @@ case "$command" in
   stop) stop_batch "$@" ;;
   restart) restart_batch "$@" ;;
   set-proxy|proxy) set_proxy "$@" ;;
+  set-schedule|time) set_schedule "$@" ;;
   status) status_accounts "$@" ;;
   list) list_accounts "$@" ;;
   watch) if (( $# > 0 )); then watch_batch "$@"; else watch_batch; fi ;;
