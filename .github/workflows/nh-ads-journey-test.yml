@@ -1,0 +1,353 @@
+name: NH Ads Journey Test (isolated, dispatch-only)
+
+# ════════════════════════════════════════════════════════════════════
+# 隔離實測（一次性驗證，唔係日常流程）：
+#   上游 xxbb678/dafaguo 嘅「純瀏覽器廣告旅程」能否令 NeoHeberg 餘額真正上升？
+#
+# 背景：我哋 neoheberg.py 用 requests 直接 GET 廣告結算連結 → HTTP 200 但余额未增，
+#       連續 169/170 次零入賬、餘額凍結 2.60。上游已經改寫成「真瀏覽器過 Cap +
+#       打地鼠 + 回站讀餘額」，自述實測 12.03 → 14.24 coins（法國 WARP 出口）。
+#
+# 硬性約束（用戶拍板）：
+#   1. 只准 workflow_dispatch — 冇 schedule / 冇 cron，唔會搶 neoheberg-afk.yml 嘅時段或額度。
+#   2. 上游版本 pin 死一個 commit（UPSTREAM_SHA），唔用浮動 branch/tag，開跑前驗 sha256。
+#   3. 最多 3 輪廣告就收工（watchdog 數 log 嘅「轮完成」）＋ wall-clock 硬上限。
+#   4. 唔提供任何 TG secret — 上游 send_tg() 見唔到 TG_BOT_TOKEN/TG_CHAT_ID 就即刻 return
+#      （上游 neoheberg.py:73-82），所以測試期間零 TG 推送。
+#   5. 只讀我哋 repo（checkout 只為攞 setup_proxy.sh）；上游腳本落 temp 目錄，
+#      唔會改、唔會 commit 任何 repo 檔案。
+#   6. 主流程（neoheberg-afk.yml）同 neoheberg.py 完全唔動。
+# ════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: nh-ads-journey-test   # 獨立 group，唔會撞 neoheberg-afk
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: xxbb678/dafaguo
+  UPSTREAM_SHA: f0fb7414d0898715834163af45deb01e8e82440c   # 2026-09-29 fix: 刷满100条后被看护cron反复拉起
+  UPSTREAM_NEOHEBERG_SHA256: 206309abdd245f7286d7b2069e7629e2982df86449ca9d39940d14dcdd5adb9c
+  MAX_ROUNDS: '3'
+  WALL_CAP_S: '690'      # neoheberg.py 進程硬上限（11.5 分鐘）；job 上限 20 分鐘
+
+jobs:
+  journey:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Plan / guard-rails
+        run: |
+          set -euo pipefail
+          echo "上游 repo   : $UPSTREAM_REPO"
+          echo "上游 commit : $UPSTREAM_SHA  (pin 死，唔會跟 branch 郁)"
+          echo "廣告輪數上限: $MAX_ROUNDS 輪，之後 kill"
+          echo "進程硬上限  : ${WALL_CAP_S}s，job timeout 20 分鐘"
+          echo "TG 狀態     : TG_BOT_TOKEN=${TG_BOT_TOKEN:-<unset>} TG_CHAT_ID=${TG_CHAT_ID:-<unset>} → 零 TG 推送"
+          echo "我哋 repo HEAD: $(git rev-parse HEAD)"
+          echo "我哋 repo 工作區改動: $(git status --porcelain | wc -l) 行（應該係 0）"
+
+      - name: Fetch upstream @ pinned commit into temp dir
+        run: |
+          set -euo pipefail
+          UP="$RUNNER_TEMP/upstream"
+          rm -rf "$UP" && mkdir -p "$UP"
+          curl -fsSL -o "$RUNNER_TEMP/upstream.tar.gz" \
+            "https://codeload.github.com/${UPSTREAM_REPO}/tar.gz/${UPSTREAM_SHA}"
+          tar -xzf "$RUNNER_TEMP/upstream.tar.gz" -C "$UP" --strip-components=1
+          echo "--- 落咗嘅上游檔案 ---"
+          ls -la "$UP"
+          echo "--- pin 校驗：neoheberg.py sha256 ---"
+          echo "$UPSTREAM_NEOHEBERG_SHA256  $UP/neoheberg.py" | sha256sum -c -
+          echo "--- 入口／依賴自我檢查 ---"
+          grep -n "from ruyipage\|/root/.cache/ruyipage\|while True:\|def main" "$UP/neoheberg.py" | head
+
+      - name: Install system deps (xvfb + Firefox GUI libs)
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb xauth >/dev/null
+          # 同上游 install.sh:598-615 一樣嘅逐包安裝（單包名唔存在唔會拖冧全條）
+          for pkg in libgtk-3-0 libdbus-glib-1-2 libasound2 libxt6 libx11-xcb1 \
+                     libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
+                     libpango-1.0-0 libcairo2 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+                     libxkbcommon0 libxshmfence1 libdrm2 libxcb1 libnspr4 libnss3; do
+            sudo apt-get install -y -qq "$pkg" >/dev/null 2>&1 \
+              || sudo apt-get install -y -qq "${pkg}t64" >/dev/null 2>&1 || true
+          done
+          command -v xvfb-run && echo "OK: xvfb-run 就緒"
+
+      - name: Install ruyipage + Firefox runtime (root, HOME=/root)
+        run: |
+          set -euo pipefail
+          pip install --quiet curl_cffi "ruyipage==1.2.72"
+          python -c "import ruyipage; print('ruyipage', ruyipage.__version__)"
+          # 上游 neoheberg.py:294 硬編碼 glob /root/.cache/ruyipage/browsers/firefox-*/firefox/firefox
+          # （同上游 install.sh:513 一致），所以 Firefox runtime 一定要裝入 /root 下面，
+          # 而測試進程亦要以 root 跑。呢度唔改上游任何一行 code，只配合佢嘅路徑假設。
+          sudo env HOME=/root PATH="$PATH" python -m ruyipage install
+          sudo env HOME=/root PATH="$PATH" python -m ruyipage doctor
+          sudo ls -d /root/.cache/ruyipage/browsers/firefox-*/firefox/firefox
+
+      - name: Setup residential proxy (sing-box via NODE_LINK)
+        continue-on-error: true
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: bash ./setup_proxy.sh
+
+      - name: Prepare harness scripts (temp only, 唔入 repo)
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/nh_balance_probe.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          # 獨立餘額探針：用我哋 repo 現有 NH_COOKIE 種子 cookie 直接讀面板，
+          # 唔經瀏覽器、唔經上游腳本。cookie 過期照樣印出結果，唔會令 workflow 失敗。
+          import os, re, sys
+          from curl_cffi import requests
+
+          ADS_URL = "https://dash.neoheberg.fr/shop/ads"
+
+          def parse_cookie_seed(raw):
+              out = {}
+              for part in (raw or "").split(";"):
+                  if "=" in part:
+                      k, v = part.strip().split("=", 1)
+                      if k:
+                          out[k] = v
+              return out
+
+          def main():
+              tag = sys.argv[1] if len(sys.argv) > 1 else "?"
+              raw = os.environ.get("NH_COOKIE", "")
+              if not raw.strip():
+                  print(f"BALANCE_PROBE[{tag}]=n/a (no NH_COOKIE seed)")
+                  return
+              s = requests.Session(impersonate="chrome120")
+              try:
+                  s.cookies.update(parse_cookie_seed(raw))
+              except Exception as e:
+                  print(f"BALANCE_PROBE[{tag}]=error (cookie set {type(e).__name__})")
+                  return
+              try:
+                  r = s.get(ADS_URL, timeout=30)
+              except Exception as e:
+                  print(f"BALANCE_PROBE[{tag}]=error ({type(e).__name__})")
+                  return
+              if "/login" in r.url or "Connexion" in r.text[:600].replace(" ", ""):
+                  print(f"BALANCE_PROBE[{tag}]=stale (cookie 已過期, HTTP {r.status_code})")
+                  return
+              clean = re.sub(r'<[^>]+>', ' ', r.text)
+              m = re.search(r'Solde\s*([\d,\.]+)\s*coins', clean, re.IGNORECASE) \
+                  or re.search(r'([\d,\.]+)\s*coins', clean, re.IGNORECASE)
+              if not m:
+                  print(f"BALANCE_PROBE[{tag}]=unknown (HTTP {r.status_code}, 未匹配到余额)")
+                  return
+              print(f"BALANCE_PROBE[{tag}]={float(m.group(1).replace(',', '.')):.4f}")
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+          cat > "$RUNNER_TEMP/nh_journey_watch.sh" <<'SHEOF'
+          #!/usr/bin/env bash
+          # 隔離測試 watchdog：跑上游 neoheberg.py（純瀏覽器廣告流程），最多 N 輪就 kill 收工。
+          # 一定要以 root 執行（上游硬編碼 /root/.cache/ruyipage）。
+          set -uo pipefail
+
+          UP_DIR="${1:?upstream dir}"
+          LOG_FILE="${2:?log file}"
+          MAX_ROUNDS="${3:-3}"
+          WALL_CAP="${4:-690}"
+
+          cd "$UP_DIR" || exit 9
+          : > "$LOG_FILE"
+
+          export BROWSER_WORK_DIR="${BROWSER_WORK_DIR:-$UP_DIR/browser-work}"
+          mkdir -p "$BROWSER_WORK_DIR/profiles"
+          chmod -R 777 "$BROWSER_WORK_DIR" 2>/dev/null || true
+
+          echo "[watch] upstream      = $UP_DIR"
+          echo "[watch] rounds cap    = $MAX_ROUNDS"
+          echo "[watch] wall cap      = ${WALL_CAP}s"
+          echo "[watch] work dir      = $BROWSER_WORK_DIR"
+          echo "[watch] PROXY         = ${PROXY:-(none/直連)}"
+          echo "[watch] TG token      = ${TG_BOT_TOKEN:-<unset → send_tg() 直接 return，零推送>}"
+          echo "[watch] cmd           = xvfb-run -a -s '-screen 0 1280x800x24' python neoheberg.py"
+
+          before_ts=$(date +%s)
+          setsid xvfb-run -a -s "-screen 0 1280x800x24" python neoheberg.py >> "$LOG_FILE" 2>&1 &
+          CHILD=$!
+          echo "[watch] launched pid=$CHILD (新 process group)"
+
+          reason="process-exit"
+          while :; do
+            if ! kill -0 "$CHILD" 2>/dev/null; then reason="process-exit"; break; fi
+            n=$(grep -c "轮完成" "$LOG_FILE" 2>/dev/null)
+            n=${n:-0}
+            if [ "$n" -ge "$MAX_ROUNDS" ]; then reason="max-rounds($n)"; break; fi
+            if [ "$(( $(date +%s) - before_ts ))" -ge "$WALL_CAP" ]; then reason="wall-cap"; break; fi
+            sleep 1
+          done
+          elapsed=$(( $(date +%s) - before_ts ))
+          echo "[watch] stopping: reason=$reason elapsed=${elapsed}s"
+
+          kill -TERM -- "-$CHILD" 2>/dev/null || kill -TERM "$CHILD" 2>/dev/null || true
+          for _ in $(seq 1 15); do kill -0 "$CHILD" 2>/dev/null || break; sleep 1; done
+          kill -KILL -- "-$CHILD" 2>/dev/null || true
+          pkill -f "ruyipage/browsers" 2>/dev/null || true
+          pkill -f Xvfb 2>/dev/null || true
+          sleep 2
+          echo "[watch] done elapsed=${elapsed}s"
+          exit 0
+          SHEOF
+          chmod +x "$RUNNER_TEMP/nh_journey_watch.sh"
+
+          cat > "$RUNNER_TEMP/nh_journey_summary.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          # 讀上游自己嘅 log，出總結：BEFORE/AFTER/DELTA/ROUNDS/CAP
+          import os, re, sys
+
+          log_path = sys.argv[1]
+          out_path = sys.argv[2]
+          txt = open(log_path, encoding="utf-8", errors="replace").read() if os.path.exists(log_path) else ""
+          lines = txt.splitlines()
+
+          def f(x):
+              try:
+                  return float(x.replace(",", "."))
+              except Exception:
+                  return None
+
+          m = re.search(r"挂机任务开始！余额\s*([\d.,]+)\s*coins", txt)
+          before = f(m.group(1)) if m else None
+          m = re.search(r"今日已看\s*(\d+)\s*/\s*100", txt)
+          seen_before = int(m.group(1)) if m else None
+
+          rounds = re.findall(r"第\s*(\d+)\s*轮完成！余额\s*([\d.,]+)\s*coins（本轮\s*\+?(-?[\d.,]+)）已看\s*(\d+)/100", txt)
+          gains = [f(g) for _, _, g, _ in rounds]
+          gains = [g for g in gains if g is not None]
+          after = f(rounds[-1][1]) if rounds else None
+          seen_after = int(rounds[-1][3]) if rounds else None
+
+          # 平面 fallback：如果格式微調過，用最後一條「余额 x coins」
+          if after is None:
+              allb = re.findall(r"余额\s*([\d.,]+)\s*coins", txt)
+              after = f(allb[-1]) if allb else None
+
+          delta = (after - before) if (before is not None and after is not None) else None
+          rounds_n = len(rounds)
+
+          cap_widget = "cap-widget" in txt or "破盾" in txt
+          cap_passed = "破盾成功" in txt
+          puzzle = "打地鼠" in txt
+          login_fail = "登录失败" in txt
+          crashed = "严重错误导致退出" in txt
+
+          if rounds_n >= 1:
+              cap = "pass"
+          elif cap_passed:
+              cap = "pass(partial: 破盾成功但未完成任何一輪)"
+          else:
+              cap = "fail"
+
+          def s(v, fmt="{:.4f}"):
+              return fmt.format(v) if v is not None else "?"
+
+          summary = [
+              f"BEFORE={s(before)} AFTER={s(after)} DELTA={s(delta)} ROUNDS={rounds_n} CAP={cap}",
+              f"SEEN_BEFORE={seen_before if seen_before is not None else '?'}/100 SEEN_AFTER={seen_after if seen_after is not None else '?'}/100",
+              f"SUM_ROUND_GAINS={s(sum(gains) if gains else None)} ROUND_GAINS={[gains[i] for i in range(len(gains))]}",
+              f"CAP_WIDGET_SEEN={'yes' if cap_widget else 'no'} CAP_PASSED={'yes' if cap_passed else 'no'} PUZZLE_SEEN={'yes' if puzzle else 'no'}",
+              f"LOGIN_FAILED={'yes' if login_fail else 'no'} CRASHED={'yes' if crashed else 'no'}",
+              f"LOG_LINES={len(lines)}",
+              "---- 上游 log 尾 40 行 ----",
+          ] + ["  " + l for l in lines[-40:]]
+          text = "\n".join(summary) + "\n"
+          open(out_path, "w", encoding="utf-8").write(text)
+          print(text)
+          PYEOF
+
+          ls -la "$RUNNER_TEMP"/nh_*.py "$RUNNER_TEMP"/nh_journey_watch.sh
+
+      - name: Balance BEFORE (independent, NH_COOKIE seed, no browser)
+        continue-on-error: true
+        env:
+          NH_COOKIE: ${{ secrets.NH_COOKIE }}
+        run: |
+          python "$RUNNER_TEMP/nh_balance_probe.py" before | tee "$RUNNER_TEMP/balance_before.txt"
+
+      - name: Ads journey (real browser, max ${{ env.MAX_ROUNDS }} rounds)
+        env:
+          EMAIL: ${{ secrets.NH_EMAIL }}
+          PASSWORD: ${{ secrets.NH_PASSWORD }}
+          PROXY: ${{ env.PROXY_SERVER }}
+        run: |
+          set -uo pipefail
+          UP="$RUNNER_TEMP/upstream"
+          LOG="$RUNNER_TEMP/journey.log"
+          # secrets 缺席（例如未設 NH_EMAIL）唔應該令 step 直接爆 unbound variable：
+          # 照傳空字串落去，由上游自己印「❌ 未配置 EMAIL 或 PASSWORD」再 exit 1。
+          # 刻意唔傳 TG_BOT_TOKEN / TG_CHAT_ID / NOTIFY_NAME：
+          # 上游 send_tg() 冇兩隻 env 就直接 return（上游 neoheberg.py:73-82）→ 零 TG 推送。
+          sudo env HOME=/root PATH="$PATH" \
+               EMAIL="${EMAIL:-}" PASSWORD="${PASSWORD:-}" PROXY="${PROXY:-}" \
+               BROWSER_WORK_DIR="$RUNNER_TEMP/nh-work" \
+               bash "$RUNNER_TEMP/nh_journey_watch.sh" "$UP" "$LOG" "$MAX_ROUNDS" "$WALL_CAP_S"
+          rc=$?
+          echo "--- watchdog rc=$rc，log 大小: $(wc -l < "$LOG" 2>/dev/null || echo 0) 行 ---"
+
+      - name: Balance AFTER (independent, NH_COOKIE seed, no browser)
+        if: always()
+        continue-on-error: true
+        env:
+          NH_COOKIE: ${{ secrets.NH_COOKIE }}
+        run: |
+          python "$RUNNER_TEMP/nh_balance_probe.py" after | tee "$RUNNER_TEMP/balance_after.txt"
+
+      - name: Summary (BEFORE/AFTER/DELTA/ROUNDS/CAP)
+        if: always()
+        run: |
+          set -uo pipefail
+          LOG="$RUNNER_TEMP/journey.log"
+          [ -f "$LOG" ] || touch "$LOG"
+          # 證據抄一份入 workspace 相對路徑，方便 upload-artifact 打包
+          mkdir -p ./journey-evidence
+          cp "$LOG" ./journey-evidence/journey.log
+          cp "$RUNNER_TEMP"/balance_*.txt ./journey-evidence/ 2>/dev/null || true
+          python "$RUNNER_TEMP/nh_journey_summary.py" "$LOG" "$RUNNER_TEMP/journey_summary.txt" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          cp "$RUNNER_TEMP/journey_summary.txt" ./journey-evidence/journey_summary.txt
+          {
+            echo ""
+            echo "### 獨立餘額探針（NH_COOKIE，唔經瀏覽器）"
+            cat "$RUNNER_TEMP/balance_before.txt" 2>/dev/null || true
+            cat "$RUNNER_TEMP/balance_after.txt" 2>/dev/null || true
+            echo ""
+            echo "### TG"
+            echo "本 run 冇提供任何 TG secret → 零 TG 推送（設計如此）。"
+            echo ""
+            echo "### 上游 log 全文"
+            echo '```'
+            cat "$LOG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload journey evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nh-ads-journey-log
+          path: journey-evidence/
+          if-no-files-found: warn
+          retention-days: 7
