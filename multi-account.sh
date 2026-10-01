@@ -55,6 +55,21 @@ mask_proxy() {
   fi
 }
 valid_time() { [[ ${1:-} =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; }
+# 站点每日计费周期的「当前日期」。
+# 站点在每天 08:00（北京时间）重置额度，所以在重置点之前，
+# 站点跑的还是「昨天」这一轮。若这里用 date +%F 会与 neoheberg.py 写出的
+# 标记日期错位，导致看护误判/漏判。两端必须用同一套算法。
+# 可用 DAFAGUO_SITE_RESET_HOUR 覆盖（需与 neoheberg.py 的 NH_SITE_RESET_HOUR 一致）。
+site_day() {
+  local h reset=${DAFAGUO_SITE_RESET_HOUR:-8}
+  h=$(date +%-H)
+  if (( h < reset )); then
+    date -d 'yesterday' +%F
+  else
+    date +%F
+  fi
+}
+
 account_dir() { printf '%s/%s' "$ACCOUNTS_DIR" "$1"; }
 require_name() { valid_name "${1:-}" || fail '账号名只能包含字母、数字、下划线和连字符，且不能以符号开头'; }
 require_account() { require_name "$1"; [[ -d "$(account_dir "$1")" ]] || fail "账号不存在：$1"; }
@@ -209,7 +224,7 @@ watch_account() {
   if ! ([[ ${pid:-} =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null); then
     # 今日 100 条已刷满：neoheberg.py 是正常收工退出的，别把它当"意外死亡"拉起，
     # 否则每分钟空转一次 Firefox，并重复推送 TG 战报。
-    local done_marker="$dir/state/profiles/done-$(date +%F)"
+    local done_marker="$dir/state/profiles/done-$(site_day)"
     if [[ -f "$done_marker" ]]; then
       printf 'watch[%s]: 今日广告已刷满，正常收工，不再拉起\n' "$name"
       rm -f "$pid_file"

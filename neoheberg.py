@@ -53,11 +53,22 @@ except Exception:
     pass
 
 STATE_FILE = os.path.join(WORK_DIR, "neoheberg_afk_state.json")
-# 每日完成标记：文件名带日期，跨天自动失效，无需人工清理。
+# 每日完成标记：文件名按「站点的计费周期」而非北京日期。
+# 站点每日额度在每天 08:00（北京时间）重置，若直接用 date +%F：
+#   - 08:00 前触发时站点仍显示昨天的 100/100，会误判「今天已完成」而写死标记
+#   - 结果当天剩余时间全部不挂机，且状态一切正常、无人察觉
+# 所以按站点周期算：当前小时早于重置点，说明站点还在跑昨天的周期，标记用昨天日期。
+SITE_RESET_HOUR = int(os.environ.get("NH_SITE_RESET_HOUR", "8"))
+_now = time.localtime()
+if _now.tm_hour < SITE_RESET_HOUR:
+    _site_day = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+else:
+    _site_day = time.strftime("%Y-%m-%d")
+
 # 用途：刷满 100 条后进程会正常退出，但 multi-account.sh 的每分钟看护 cron
 # 会把"已干净退出"误判成"意外死亡"从而反复拉起，既空转又重复推送 TG 战报。
 # 写这个标记后，启动与看护都会先检查它，避免重启。
-DONE_MARKER = os.path.join(WORK_DIR, f"done-{time.strftime('%Y-%m-%d')}")
+DONE_MARKER = os.path.join(WORK_DIR, f"done-{_site_day}")
 
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID", "")
