@@ -569,6 +569,25 @@ WantedBy=timers.target
 EOF
     chmod 644 "$SYSTEMD_DIR/dafaguo-$name.service" "$SYSTEMD_DIR/dafaguo-$name.timer"
     if [[ $SYSTEMD_DIR == "$HOME/.config/systemd/user" ]] && command -v systemctl >/dev/null 2>&1; then
+      # 清理陈旧的 service 实例。
+      # 早期版本的 service 带 RemainAfterExit=yes，会留下 active(exited) 的僵尸实例；
+      # 单元文件重建后 systemd 的运行时状态并不会同步更新，于是下次 timer 触发时
+      # 它认为「service 已经 active」而直接跳过 —— timer 显示触发了，账号却根本没起。
+      # 只处理「SubState=exited 且挂机进程确实已死」的陈旧实例；
+      # 绝不能对正在跑的账号 stop，那会触发 ExecStop 把挂机杀掉。
+      local svc="dafaguo-$name.service" sub pid_file sp alive=0
+      sub=$(systemctl --user show "$svc" -p SubState --value 2>/dev/null)
+      pid_file="$dir/run.pid"
+      if [[ -f "$pid_file" ]]; then
+        read -r sp < "$pid_file" 2>/dev/null || true
+        if [[ ${sp:-} =~ ^[0-9]+$ ]] && kill -0 "$sp" 2>/dev/null; then
+          alive=1
+        fi
+      fi
+      if [[ "$sub" == "exited" && $alive -eq 0 ]]; then
+        systemctl --user stop "$svc" >/dev/null 2>&1
+        systemctl --user reset-failed "$svc" >/dev/null 2>&1
+      fi
       systemctl --user enable --now "dafaguo-$name.timer" >/dev/null
     fi
   done
