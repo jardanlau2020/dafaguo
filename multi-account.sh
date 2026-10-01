@@ -244,23 +244,32 @@ watch_account() {
   # 走到这里说明进程 PID 活着。但「活着」不等于「在干活」：
   # 浏览器会话已经死掉、Python 只是在空转报错时，kill -0 依然成功，
   # 上面那条「进程已死」分支永远不会触发，脚本会一直假装正常。
-  # 判据：最新日志的 mtime 距今超过 STUCK_MINUTES 分钟（正常 1-2 分钟必有新行）。
+  #
+  # 判据不能用日志文件的 mtime：故障时脚本每 5 秒就写一行
+  # "挂机循环抛出异常: WebSocket 连接未建立"，mtime 始终是最新的，
+  # 那样检测永远不会触发（实测 09-30 空转 33 分钟、396 条错误，mtime 一直很新）。
+  # 改为看「进度行」的时间戳 —— 只有真正干活才会有这些行。
   if (( STUCK_MINUTES > 0 )); then
-    local latest_log log_age
+    local latest_log prog_ts log_age
     latest_log=$(ls -t "$dir"/logs/*.log 2>/dev/null | head -1)
     if [[ -n "$latest_log" ]]; then
-      log_age=$(( ( $(date +%s) - $(stat -c %Y "$latest_log" 2>/dev/null || echo 0) ) / 60 ))
-      if (( log_age >= STUCK_MINUTES )); then
-        if ! restart_budget_ok "$dir"; then
-          printf 'watch[%s]: 日志已 %d 分钟无更新（疑似卡死），但已达每小时重启上限(%d)，需人工检查\n' \
-            "$name" "$log_age" "$MAX_RESTARTS_PER_HOUR"
+      # 取最后一条「有进展」的日志时间戳（轮次完成 / 挂机启动）
+      prog_ts=$(grep -E "轮完成|挂机任务开始" "$latest_log" 2>/dev/null \
+                | tail -1 | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}')
+      if [[ -n "$prog_ts" ]]; then
+        log_age=$(( ( $(date +%s) - $(date -d "$prog_ts" +%s 2>/dev/null || echo 0) ) / 60 ))
+        if (( log_age >= STUCK_MINUTES )); then
+          if ! restart_budget_ok "$dir"; then
+            printf 'watch[%s]: 已 %d 分钟无进度（疑似卡死），但已达每小时重启上限(%d)，需人工检查\n' \
+              "$name" "$log_age" "$MAX_RESTARTS_PER_HOUR"
+            return 0
+          fi
+          printf 'watch[%s]: 进程存活但已 %d 分钟无进度，判定卡死，自动重启\n' "$name" "$log_age"
+          stop_account "$name" >/dev/null 2>&1 || true
+          rm -f "$pid_file"
+          start_account "$name"
           return 0
         fi
-        printf 'watch[%s]: 进程存活但日志已 %d 分钟无更新，判定卡死，自动重启\n' "$name" "$log_age"
-        stop_account "$name" >/dev/null 2>&1 || true
-        rm -f "$pid_file"
-        start_account "$name"
-        return 0
       fi
     fi
   fi
@@ -434,7 +443,7 @@ set_schedule() {
     local next; next=$(systemctl --user show "dafaguo-$name.timer" -p NextElapseUSecRealtime --value 2>/dev/null)
     printf '定时器已更新，下次触发: %s\n' "${next:-（已生效，稍后可用 list-timers 查看）}"
   else
-    warn '定时器重启失败，若时间未生效请执行: multi-account.sh install-timers'
+    printf '警告：定时器重启失败，若时间未生效请执行: multi-account.sh install-timers\n' >&2
   fi
 }
 
