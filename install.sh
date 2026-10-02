@@ -2,31 +2,50 @@
 # ============================================================
 # NeoHeberg AFK 交互式管理脚本
 # 1 安装依赖
-# 2 账号密码
+# 2 账号密码（单账号）
 # 3 配置 Telegram 通知
 # 4 查余额（实时刷新）
 # 5 每日定时挂机
 # 6 运行状态
-# 7 卸载
+# 7 多账号管理
+# 8 更新主脚本
+# 9 卸载
 # 0 退出
-# 用法：bash <(curl -fsSL https://raw.githubusercontent.com/xxbb678/dafaguo/main/install.sh)
+# 用法：bash <(curl -fsSL https://raw.githubusercontent.com/jardanlau2020/dafaguo/main/install.sh)
 # ============================================================
 set -euo pipefail
 
-REPO_RAW="https://raw.githubusercontent.com/xxbb678/dafaguo/main"
-APP_DIR="${NEOHEBERG_DIR:-/opt/neoheberg-afk}"
+# 必须指向**本仓库**：install.sh / neoheberg.py / multi-account.sh 三者是一套。
+# 若指向上游，menu_update 与安装流程会拿上游的 ruyipage/Firefox 版 neoheberg.py
+# 覆盖本仓库的 curl_cffi/Playwright 版 —— 依赖、Cap 处理、完成标记全对不上。
+REPO_RAW="${DAFAGUO_REPO_RAW:-https://raw.githubusercontent.com/jardanlau2020/dafaguo/main}"
+NEOHEBERG_DIR="${NEOHEBERG_DIR:-/root/dafaguo}"
+APP_DIR="${NEOHEBERG_DIR:-/root/dafaguo}"
 VENV="$APP_DIR/venv"
 SCRIPT="$APP_DIR/neoheberg.py"
+# 进程匹配模式：兼容「相对路径启动」(start.sh： ./venv/bin/python ./neoheberg.py)
+#           与「绝对路径启动」(菜单： $VENV/bin/python $SCRIPT)，避免状态误报为「已安装未运行」
+RUN_PATTERN='venv/bin/python.*neoheberg\\.py'
 LOG="$APP_DIR/neoheberg.log"
 ENV_FILE="$APP_DIR/env"
 PID_FILE="$APP_DIR/neoheberg.pid"
 SERVICE="neoheberg-afk"
+MULTI_SCRIPT="$APP_DIR/multi-account.sh"
+MULTI_HOME="${MULTI_HOME:-$HOME/.local/share/dafaguo-multi}"
 
 GREEN=$'\033[32m'; RED=$'\033[31m'; YELLOW=$'\033[33m'; CYAN=$'\033[36m'; NC=$'\033[0m'
 
 info() { echo "${GREEN}[*]${NC} $*"; }
 warn() { echo "${YELLOW}[!]${NC} $*"; }
 err()  { echo "${RED}[x]${NC} $*"; }
+
+# 可选严格模式：NEOHEBERG_STRICT=1 时启用 set -u，尽早暴露变量名拼写错误。
+# 默认不启用 —— 本脚本大量读取 env 文件里的可选配置（EMAIL/PASSWORD/TG_BOT_TOKEN/PROXY 等），
+# 用户未配置时这些变量本就未定义，开启 set -u 会导致脚本在读取处直接退出。
+if [ "${NEOHEBERG_STRICT:-0}" = "1" ]; then
+    set -u
+    warn "严格模式已启用（set -u）"
+fi
 ok()   { echo "${GREEN}[✓]${NC} $*"; }
 
 
@@ -246,9 +265,9 @@ do_install_system_pkgs() {
         apt-get install -y -qq xvfb >/dev/null 2>&1 || true
     fi
 
-    # Firefox 运行时所需的 GUI 库（老系统默认不安装，导致 libgtk-3.so.0 缺失）
+    # Chromium 运行时所需的 GUI 库（老系统默认不安装，导致 libgtk-3.so.0 缺失）
     if ! have_libgtk; then
-        info "补齐 Firefox 所需 GUI 库..."
+        info "补齐 Chromium 所需 GUI 库..."
         install_gui_libs
     fi
 
@@ -260,11 +279,55 @@ do_install_system_pkgs() {
     fi
     if ! have_libgtk; then
         warn "libgtk-3 缺失，重试安装..."
-        do_install_firefox_libs >/dev/null 2>&1 || true
+        do_install_browser_libs >/dev/null 2>&1 || true
     fi
 
     command -v xvfb-run >/dev/null 2>&1 || { err "xvfb-run 安装失败（apt 源可能仍不可用）"; err "请检查: cat /etc/apt/sources.list ; apt-get update"; return 1; }
-    have_libgtk || { err "libgtk-3 安装失败，Firefox 无法启动"; err "请检查 apt 源是否可用"; return 1; }
+    have_libgtk || { err "libgtk-3 安装失败，Chromium 无法启动"; err "请检查 apt 源是否可用"; return 1; }
+    return 0
+}
+
+# 下载 get-pip.py 并做完整性校验。
+# 供应链防护：下载内容必须通过 Python 语法编译检查（篡改/劫持的产物几乎必然不是合法 Python），
+# 这是不依赖易失效硬编码 hash 的稳健做法。若运维显式提供 NEOHEBERG_GETPIP_SHA256
+# 则额外做 SHA256 强校验。
+fetch_get_pip() {
+    local pyver=${1:-} gp=${2:-/tmp/neoheberg-get-pip.py} url expect actual
+    if [[ -n "$pyver" && "$pyver" =~ ^3\.[6-9]$ ]]; then
+        url="https://bootstrap.pypa.io/pip/${pyver}/get-pip.py"
+    else
+        url="https://bootstrap.pypa.io/get-pip.py"
+    fi
+    curl -fsSL --max-time 60 "$url" -o "$gp" || { err "get-pip.py 下载失败"; return 1; }
+
+    # 强校验（可选）：运维提供期望 SHA256 时必须匹配
+    if [[ -n "${NEOHEBERG_GETPIP_SHA256:-}" ]]; then
+        actual=$(sha256sum "$gp" | awk '{print $1}')
+        expect=$(printf '%s' "$NEOHEBERG_GETPIP_SHA256" | tr 'A-Z' 'a-z' | tr -d '[:space:]')
+        if [[ "$actual" != "$expect" ]]; then
+            err "get-pip.py SHA256 校验失败（期望 ${expect:0:16}… 实得 ${actual:0:16}…），已中止"
+            rm -f "$gp"
+            return 1
+        fi
+        ok "get-pip.py SHA256 校验通过"
+    fi
+
+    # 兜底校验：必须非空，且是可编译的 Python 脚本
+    if [[ ! -s "$gp" ]]; then
+        err "get-pip.py 内容为空，已中止"
+        rm -f "$gp"
+        return 1
+    fi
+    if ! python3 -c 'import sys,py_compile,tempfile,shutil,os
+src=sys.argv[1]
+try:
+    compile(open(src,"rb").read(), src, "exec")
+except SyntaxError as e:
+    sys.exit(1)' "$gp" 2>/dev/null; then
+        err "get-pip.py 完整性校验失败（内容不是合法 Python），已中止"
+        rm -f "$gp"
+        return 1
+    fi
     return 0
 }
 
@@ -293,10 +356,7 @@ ensure_venv() {
     local pyver gp
     pyver=$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "3.9")
     gp="/tmp/neoheberg-get-pip.py"
-    case "$pyver" in
-        3.6|3.7|3.8|3.9) curl -fsSL "https://bootstrap.pypa.io/pip/${pyver}/get-pip.py" -o "$gp" ;;
-        *)               curl -fsSL "https://bootstrap.pypa.io/get-pip.py" -o "$gp" ;;
-    esac || { err "get-pip.py 下载失败"; return 1; }
+    fetch_get_pip "$pyver" "$gp" || return 1
 
     if [ -x "$VENV/bin/python" ]; then
         "$VENV/bin/python" "$gp" --no-warn-script-location >/dev/null 2>&1 || { err "pip 安装失败"; return 1; }
@@ -324,22 +384,29 @@ do_install_py_deps() {
             local gp="/tmp/neoheberg-get-pip.py"
             local pyver
             pyver=$("$VENV/bin/python" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "3.9")
-            case "$pyver" in
-                3.6|3.7|3.8|3.9) curl -fsSL "https://bootstrap.pypa.io/pip/${pyver}/get-pip.py" -o "$gp" ;;
-                *)               curl -fsSL "https://bootstrap.pypa.io/get-pip.py" -o "$gp" ;;
-            esac || { err "get-pip.py 下载失败"; return 1; }
+            fetch_get_pip "$pyver" "$gp" || return 1
             "$VENV/bin/python" "$gp" --no-warn-script-location >/dev/null 2>&1 || { err "venv 内 pip 安装失败"; return 1; }
             rm -f "$gp"
             pip="$VENV/bin/pip"
         fi
     fi
 
-    info "升级 pip 并安装 curl_cffi / ruyipage（首次较慢）..."
+    # 依赖以本仓库 neoheberg.py 的 import 为准：
+    #   from curl_cffi import requests, CurlOpt        ← 防指纹 HTTP 会话（主循环用）
+    #   from playwright.sync_api import sync_playwright ← 真 Chromium 点 Cap 验证码
+    # 注意：本仓库**不用** ruyipage（那是上游的 Firefox 路线）。装错依赖会导致
+    # 要么 ImportError 秒退，要么白下几百 MB 用不上的 Firefox 运行时。
+    info "升级 pip 并安装 curl_cffi / playwright（首次较慢）..."
     $pip install --quiet --upgrade pip >/dev/null 2>&1 || true
-    $pip install --quiet curl_cffi ruyipage || { err "Python 依赖安装失败"; return 1; }
+    $pip install --quiet curl_cffi playwright || { err "Python 依赖安装失败"; return 1; }
 
     # 提前验证导入，避免后续运行才报错
-    "$VENV/bin/python" -c 'import curl_cffi, ruyipage' 2>/dev/null || { err "依赖导入失败，请看上方 pip 输出"; return 1; }
+    "$VENV/bin/python" -c 'import curl_cffi, playwright' 2>/dev/null || { err "依赖导入失败，请看上方 pip 输出"; return 1; }
+
+    # Chromium 运行时（点 Cap 用）。已装过时 playwright 会自行跳过，不会重复下载。
+    info "安装 Playwright Chromium 运行时（含系统库，首次约 150MB）..."
+    "$VENV/bin/python" -m playwright install --with-deps chromium \
+        || { err "Chromium 安装失败（Cap 验证码将无法通过）"; return 1; }
     ok "Python 依赖就绪"
     return 0
 }
@@ -409,7 +476,7 @@ menu_install() {
 
     do_install_deps || return 1
     ok "安装完成"
-    echo "    下一步：选菜单 [2] 填写账号密码"
+    echo "    下一步：选菜单 [2] 填写账号密码，或选 [7] 多账号管理"
 }
 
 # ---------- 账号密码 ----------
@@ -441,7 +508,7 @@ menu_account() {
     write_env_file
     ok "账号密码已保存到 $ENV_FILE"
 
-    if pgrep -f "$SCRIPT" >/dev/null 2>&1; then
+    if pgrep -f "$RUN_PATTERN" >/dev/null 2>&1; then
         printf "账号修改需重启才生效，是否立即重启？[y/N]: "
         local rr
         read -r rr || rr=""
@@ -458,18 +525,22 @@ do_install_deps() {
     ensure_venv || return 1
     do_install_py_deps || return 1
 
-    if ! ls -d /root/.cache/ruyipage/browsers/firefox-* >/dev/null 2>&1; then
-        info "下载 Firefox 运行时（约百兆，首次较慢）..."
-        "$VENV/bin/python" -m ruyipage install || { err "Firefox 运行时下载失败"; return 1; }
-    else
-        ok "Firefox 运行时已存在"
-    fi
+    # 浏览器运行时（Chromium）已由 do_install_py_deps 里的
+    # `python -m playwright install --with-deps chromium` 装好，此处不再重复下载。
+    # 注意：本仓库不用 ruyipage/Firefox，所以不能再依赖 `python -m ruyipage install`。
 
     info "下载主脚本..."
     if [ -f "$APP_DIR/neoheberg.py.local" ]; then
         cp "$APP_DIR/neoheberg.py.local" "$SCRIPT"
     else
         curl -fsSL "$REPO_RAW/neoheberg.py" -o "$SCRIPT" || { err "脚本下载失败"; return 1; }
+    fi
+
+    # 多账号管理脚本（菜单 [7] 使用；缺失不影响单账号功能）
+    if ! curl -fsSL "$REPO_RAW/multi-account.sh" -o "$MULTI_SCRIPT" 2>/dev/null; then
+        warn "multi-account.sh 下载失败，多账号菜单暂不可用"
+    else
+        chmod +x "$MULTI_SCRIPT"
     fi
 
     # 下载后必须先适配老 Python 注解，否则语法检查/启动会直接报错
@@ -483,55 +554,36 @@ do_install_deps() {
     fi
     ok "主脚本语法自检通过"
 
-    # 实测 Firefox 能否启动，提前暴露缺库问题
-    if ! xvfb-run -a "$VENV/bin/python" -c '
-import subprocess, sys, time, os, glob
-ff = glob.glob("/root/.cache/ruyipage/browsers/firefox-*/firefox/firefox")
-if not ff:
-    sys.exit(1)
-subprocess.run([ff[0], "--headless", "--version"], capture_output=True, timeout=60)
-' >/dev/null 2>&1; then
-        warn "Firefox 启动自检未通过（可能缺 GUI 库），将尝试补齐..."
-        do_install_firefox_libs >/dev/null 2>&1 || true
-    fi
-
-    # 安装后自检：验证 Firefox 在 xvfb 下能启动并开放调试端口（提前暴露沙箱/缺库问题）
-    info "运行安装自检..."
-    if xvfb-run -a "$VENV/bin/python" - <<'PYEOF' >/dev/null 2>&1
-import glob, subprocess, sys, time, socket
-ff = glob.glob("/root/.cache/ruyipage/browsers/firefox-*/firefox/firefox")
-if not ff:
-    sys.exit(1)
-port = 28901
-env = dict(__import__("os").environ)
-for k in ("MOZ_DISABLE_CONTENT_SANDBOX","MOZ_DISABLE_GMP_SANDBOX","MOZ_DISABLE_RDD_SANDBOX","MOZ_DISABLE_SOCKET_PROCESS_SANDBOX","MOZ_DISABLE_GPU_SANDBOX"):
-    env[k] = "1"
-p = subprocess.Popen([ff[0], f"--remote-debugging-port={port}", "--no-remote", "--marionette", "--profile", "/tmp/nh_selfcheck"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-ok = False
-for _ in range(60):
-    try:
-        s = socket.create_connection(("127.0.0.1", port), timeout=1)
-        s.close(); ok = True; break
-    except Exception:
-        time.sleep(1)
-p.terminate()
-try: p.wait(timeout=10)
-except Exception: p.kill()
-sys.exit(0 if ok else 1)
-PYEOF
-    then
-        ok "自检通过：Firefox 可正常启动"
+    # 安装后自检：真正拉起一次 Playwright Chromium（缺库/缺运行时会在这里暴露）
+    info "运行安装自检（Playwright + Chromium）..."
+    if check_chromium_launch; then
+        ok "自检通过：Chromium 可正常启动"
     else
-        warn "自检未通过（Firefox 可能无法启动），将尝试补齐 GUI 库后重试"
-        do_install_firefox_libs >/dev/null 2>&1 || true
+        warn "自检未通过（Chromium 可能缺系统库），尝试补齐 GUI 库后重试..."
+        do_install_browser_libs >/dev/null 2>&1 || true
+        if check_chromium_launch; then
+            ok "补齐后自检通过：Chromium 可正常启动"
+        else
+            warn "Chromium 仍无法启动，Cap 验证码环节可能失败（其余功能不受影响）"
+        fi
     fi
 
     ok "安装完成"
     return 0
 }
 
-# 补齐 Firefox GUI 库（独立函数，供自检失败时调用）
-do_install_firefox_libs() {
+# Playwright Chromium 冒烟测试：真正 launch 一次，缺库/缺运行时即失败
+check_chromium_launch() {
+    "$VENV/bin/python" - <<'PYEOF' >/dev/null 2>&1
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    b = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+    b.close()
+PYEOF
+}
+
+# 补齐浏览器 GUI 库（独立函数，供自检失败时调用）
+do_install_browser_libs() {
     install_gui_libs
 }
 
@@ -557,13 +609,13 @@ install_gui_libs() {
 
 # ---------------- 启停 ----------------
 start_bot() {
-    if pgrep -f "$SCRIPT" >/dev/null 2>&1; then
+    if pgrep -f "$RUN_PATTERN" >/dev/null 2>&1; then
         warn "已在运行中，无需重复启动"
         return 0
     fi
     load_env
     if [ -z "${EMAIL:-}" ] || [ -z "${PASSWORD:-}" ]; then
-        err "未配置账号密码，请先选菜单 [1]"
+        err "未配置账号密码，请先选菜单 [2]"
         return 1
     fi
     if [ ! -x "$VENV/bin/python" ] || [ ! -f "$SCRIPT" ]; then
@@ -571,23 +623,18 @@ start_bot() {
         return 1
     fi
     cd "$APP_DIR"
-    # LXC/容器内 Firefox 沙箱会导致调试端口不开，必须禁用
+    # Chromium 已用 --no-sandbox 启动（见 neoheberg.py）；xvfb-run 保留以兼容 NH_HEADLESS=0 的有头模式
     export _NH_SANDBOX_OFF=1
     # setsid 脱离会话：SSH 断开也不会把挂机进程带走
     if command -v setsid >/dev/null 2>&1; then
-        setsid xvfb-run -a -s "-screen 0 1024x768x24" env \
-            MOZ_DISABLE_CONTENT_SANDBOX=1 \
-            MOZ_DISABLE_GMP_SANDBOX=1 \
-            MOZ_DISABLE_RDD_SANDBOX=1 \
-            MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1 \
-            MOZ_DISABLE_GPU_SANDBOX=1 \
+        setsid xvfb-run -a -s "-screen 0 1024x768x24" \
             "$VENV/bin/python" "$SCRIPT" >> "$LOG" 2>&1 < /dev/null &
     else
-        nohup env MOZ_DISABLE_CONTENT_SANDBOX=1 MOZ_DISABLE_GMP_SANDBOX=1 MOZ_DISABLE_RDD_SANDBOX=1 MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1 MOZ_DISABLE_GPU_SANDBOX=1 xvfb-run -a "$VENV/bin/python" "$SCRIPT" >> "$LOG" 2>&1 &
+        nohup xvfb-run -a "$VENV/bin/python" "$SCRIPT" >> "$LOG" 2>&1 &
     fi
     echo $! > "$PID_FILE"
     sleep 3
-    if pgrep -f "$SCRIPT" >/dev/null 2>&1; then
+    if pgrep -f "$RUN_PATTERN" >/dev/null 2>&1; then
         ok "已后台启动（PID $(cat "$PID_FILE" 2>/dev/null)）"
     else
         err "启动失败，请看日志: tail -20 $LOG"
@@ -599,7 +646,8 @@ stop_bot() {
         kill "$(cat "$PID_FILE")" 2>/dev/null || true
         rm -f "$PID_FILE"
     fi
-    pkill -f "$SCRIPT" 2>/dev/null || true
+    pkill -f "$RUN_PATTERN" 2>/dev/null || true
+    pkill -f "xvfb-run.*neoheberg\.py" 2>/dev/null || true
     ok "已停止"
 }
 
@@ -650,7 +698,7 @@ ${_test_text}"
         warn "未填写完整，已清空 TG 配置"
     fi
 
-    if pgrep -f "$SCRIPT" >/dev/null 2>&1; then
+    if pgrep -f "$RUN_PATTERN" >/dev/null 2>&1; then
         printf "通知修改需重启才生效，是否立即重启？[y/N]: "
         local rr
         read -r rr || rr=""
@@ -672,8 +720,8 @@ menu_status() {
     fi
 
     load_env
-    if pgrep -f "$SCRIPT" >/dev/null 2>&1; then
-        ok "进程：运行中 (PID: $(pgrep -f "$SCRIPT" | tr '\n' ' '))"
+    if pgrep -f "$RUN_PATTERN" >/dev/null 2>&1; then
+        ok "进程：运行中 (PID: $(pgrep -f "$RUN_PATTERN" | tr '\n' ' '))"
     else
         warn "进程：未运行"
     fi
@@ -826,11 +874,6 @@ while True:
 PYEOF
 
     xvfb-run -a -s "-screen 0 1024x768x24" env \
-        MOZ_DISABLE_CONTENT_SANDBOX=1 \
-        MOZ_DISABLE_GMP_SANDBOX=1 \
-        MOZ_DISABLE_RDD_SANDBOX=1 \
-        MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1 \
-        MOZ_DISABLE_GPU_SANDBOX=1 \
         NH_SCRIPT="$SCRIPT" \
         "$VENV/bin/python" "$_BALPY"
     rm -f "$_BALPY"
@@ -853,7 +896,7 @@ schedule_install() {
         return 1
     fi
     if [ ! -f "$ENV_FILE" ]; then
-        err "未配置账号密码，请先选菜单 [1]"
+        err "未配置账号密码，请先选菜单 [2]"
         return 1
     fi
 
@@ -884,7 +927,7 @@ schedule_install() {
 #!/bin/bash
 # 在容器内启动挂机（禁沙箱 + 脱离会话）
 # 启动前强制清理所有旧实例，避免多实例并发导致兑换不结算。
-cd /opt/neoheberg-afk || exit 1
+cd "$APP_DIR" || exit 1
 
 # ── 1. 杀掉所有旧实例（python 主程序 + xvfb-run 包装进程）──
 pkill -9 -f "venv/bin/python.*neoheberg.py" 2>/dev/null
@@ -895,7 +938,8 @@ pkill -9 -f "neoheberg.py" 2>/dev/null
 sleep 1
 # ── 2. 清理残留 Xvfb（僵尸显示会占用内存且可能抢占 display）──
 pkill -9 -f "Xvfb :" 2>/dev/null
-pkill -f firefox 2>/dev/null
+pkill -f "ms-playwright.*chrome" 2>/dev/null   # Playwright Chromium 子进程
+pkill -f firefox 2>/dev/null                   # 兼容历史 Firefox 版本残留
 sleep 1
 
 # ── 3. 验证杀干净了；还有残留就等一会儿再杀一次 ──
@@ -913,12 +957,6 @@ echo "[info] 清理完成，残留实例数: $(pgrep -f 'neoheberg.py' | wc -l)"
 set -a
 . ./env
 set +a
-
-export MOZ_DISABLE_CONTENT_SANDBOX=1
-export MOZ_DISABLE_GMP_SANDBOX=1
-export MOZ_DISABLE_RDD_SANDBOX=1
-export MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
-export MOZ_DISABLE_GPU_SANDBOX=1
 
 rm -f neoheberg.log
 
@@ -943,11 +981,6 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=$APP_DIR
 EnvironmentFile=$ENV_FILE
-Environment=MOZ_DISABLE_CONTENT_SANDBOX=1
-Environment=MOZ_DISABLE_GMP_SANDBOX=1
-Environment=MOZ_DISABLE_RDD_SANDBOX=1
-Environment=MOZ_DISABLE_SOCKET_PROCESS_SANDBOX=1
-Environment=MOZ_DISABLE_GPU_SANDBOX=1
 # KillMode=none：脚本用 setsid 脱离后台运行，不能让 systemd 在
 # oneshot 结束时清理整个 cgroup（否则会把挂机进程一并杀掉）。
 KillMode=none
@@ -1021,11 +1054,215 @@ menu_schedule() {
     esac
 }
 
+# ---------------- 多账号管理 ----------------
+require_multi() {
+    [ -x "$MULTI_SCRIPT" ] || {
+        err "multi-account.sh 不存在（安装时下载失败？）"
+        info "可重新执行菜单 [1] 安装依赖 或菜单 [8] 更新主脚本 后重试"
+        return 1
+    }
+    return 0
+}
+
+# 添加账号：交互式填写，env 文件可输入路径，留空则直接填邮箱密码
+menu_multi_add() {
+    local name schedule envpath email pass proxy tmp tg_token tg_chat
+    printf "账号名（字母/数字/下划线/连字符，如 acc-a）: "
+    read -r name || name=""
+    if ! [[ ${name:-} =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then
+        err "账号名不合法，已取消"; return 1
+    fi
+    printf "每日启动时间 HH:MM（如 06:30）: "
+    read -r schedule || schedule=""
+    if ! [[ ${schedule:-} =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+        err "时间格式不合法，已取消"; return 1
+    fi
+    printf "代理地址（可选，如 socks5://user:pass@host:port，留空=不走代理）: "
+    read -r proxy || proxy=""
+    printf "TG 机器人 Token（可选，如 123:ABC-xxx，留空=不接收通知）: "
+    read -r tg_token || tg_token=""
+    printf "TG Chat ID（可选，留空=不接收通知）: "
+    read -r tg_chat || tg_chat=""
+    printf "环境文件路径（留空则直接输入邮箱密码；env 文件自带 PROXY 时以文件为准）: "
+    read -r envpath || envpath=""
+    if [ -n "$envpath" ]; then
+        [ -f "$envpath" ] || { err "环境文件不存在：$envpath"; return 1; }
+        DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" add "$name" "$schedule" "$envpath"
+        local rc=$?
+        if [ $rc -eq 0 ] && [ -n "$proxy" ]; then
+            DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" set-proxy "$name" "$proxy"
+        fi
+        if [ $rc -eq 0 ] && [ -n "$tg_token" ] && [ -n "$tg_chat" ]; then
+            # env 文件自带的 TG 配置若为空则补写用户输入的
+            local envf="${MULTI_HOME}/accounts/${name}/account.env" line
+            while IFS= read -r line || [ -n "$line" ]; do
+                case "$line" in
+                    TG_BOT_TOKEN=*|TG_CHAT_ID=*) ;;
+                    *) printf '%s\n' "$line" >> "${envf}.tmp" ;;
+                esac
+            done < "$envf"
+            printf 'TG_BOT_TOKEN=%q\n' "$tg_token" >> "${envf}.tmp"
+            printf 'TG_CHAT_ID=%q\n' "$tg_chat" >> "${envf}.tmp"
+            cat "${envf}.tmp" > "$envf"
+            chmod 600 "$envf"
+            rm -f "${envf}.tmp"
+            info "已为该账号写入 TG 通知配置"
+        fi
+        return $rc
+    fi
+    printf "邮箱: "
+    read -r email || email=""
+    printf "密码: "
+    read -rs pass || pass=""; echo ""
+    if [ -z "$email" ] || [ -z "$pass" ]; then
+        err "邮箱或密码为空，已取消"; return 1
+    fi
+    if [ -n "$tg_token" ] && [ -z "$tg_chat" ]; then
+        warn "只填了 TG Token 没填 Chat ID，将不接收通知（两者需同时填写）"
+    fi
+    if [ -z "$tg_token" ] && [ -n "$tg_chat" ]; then
+        warn "只填了 Chat ID 没填 TG Token，将不接收通知（两者需同时填写）"
+    fi
+    tmp=$(mktemp) || return 1
+    umask 077
+    {
+        printf "EMAIL=%q\n" "$email"
+        printf "PASSWORD=%q\n" "$pass"
+        if [ -n "$tg_token" ] && [ -n "$tg_chat" ]; then
+            printf "TG_BOT_TOKEN=%q\n" "$tg_token"
+            printf "TG_CHAT_ID=%q\n" "$tg_chat"
+        else
+            printf "TG_BOT_TOKEN=\n"
+            printf "TG_CHAT_ID=\n"
+        fi
+        printf "NOTIFY_NAME=%q\n" "$name"
+        if [ -n "$proxy" ]; then
+            printf "PROXY=%q\n" "$proxy"
+        fi
+    } > "$tmp"
+    DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" add "$name" "$schedule" "$tmp"
+    local rc=$?
+    rm -f "$tmp"
+    return $rc
+}
+
+menu_multi_setproxy() {
+    local name proxy
+    printf "账号名: "
+    read -r name || name=""
+    if ! [[ ${name:-} =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then
+        err "账号名不合法，已取消"; return 1
+    fi
+    printf "代理地址（留空=清除代理）: "
+    read -r proxy || proxy=""
+    DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" set-proxy "$name" "$proxy"
+    local rc=$?
+    if [ $rc -eq 0 ] && [ -n "$proxy" ]; then
+        printf "是否立即重启该账号使代理生效？[y/N]: "
+        local rr
+        read -r rr || rr=""
+        case "$rr" in
+            y|Y|yes|YES) DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" restart "$name" ;;
+            *) info "未重启，可稍后选 [5] 重启" ;;
+        esac
+    fi
+    return $rc
+}
+
+menu_multi() {
+    require_multi || return 1
+    local c s name rc=0
+    while true; do
+        echo ""
+        echo "${CYAN}=== 多账号管理 ===${NC}"
+        DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" status || true
+        echo ""
+        echo "  [1] 添加账号（设每日启动时间/代理）"
+        echo "  [2] 删除账号"
+        echo "  [3] 启动全部账号"
+        echo "  [4] 停止全部账号"
+        echo "  [5] 重启全部账号"
+        echo "  [6] 启动/停止指定账号"
+        echo "  [7] 设置/清除账号代理"
+        echo "  [8] 安装每日定时（systemd 用户定时器）"
+        echo "  [9] 移除每日定时"
+        echo "  [10] 查看日志（选账号）"
+        echo "  [11] 修改每日启动时间"
+        echo "  [0] 返回"
+        printf "请选择 [0-11]: "
+        read -r c || continue
+        case "$c" in
+            1) menu_multi_add; rc=$? ;;
+            2)
+                printf "要删除的账号名: "
+                read -r name || name=""
+                [ -n "$name" ] || { err "未输入账号名"; }
+                [ -z "$name" ] || DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" delete "$name"
+                ;;
+            3) DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" start ;;
+            4) DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" stop ;;
+            5) DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" restart ;;
+            6)
+                printf "操作 [s]tart 启动 / [t]op 停止: "
+                read -r s || s=""
+                printf "账号名（多个用空格分隔，留空=全部）: "
+                read -r name || name=""
+                case "$s" in
+                    s|start)  DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" start $name ;;
+                    t|stop)   DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" stop $name ;;
+                    *) err "无效操作"; rc=1 ;;
+                esac
+                ;;
+            7) menu_multi_setproxy; rc=$? ;;
+            8) DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" install-timers
+               info "注销后仍需执行，请确认已启用 linger: loginctl enable-linger $USER" ;;
+            9) DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" remove-timers ;;
+            10)
+                printf "查看哪个账号的日志（留空=全部，f+账号名=实时跟踪，如 fa）: "
+                read -r name || name=""
+                if [ ! -d "${MULTI_HOME}/accounts" ]; then
+                    info "还没有多账号数据（$MULTI_HOME）"
+                elif [[ ${name:-} == f* && ${#name} -gt 1 ]]; then
+                    tail -f "${MULTI_HOME}/accounts/${name#f}/logs/$(date +%F).log" 2>/dev/null || err "日志不存在（账号可能还没跑过）"
+                elif [ -n "${name:-}" ]; then
+                    ls -1t "${MULTI_HOME}/accounts/$name"/logs/*.log 2>/dev/null | head -3 | sed 's/^/    /'
+                    tail -n 20 "${MULTI_HOME}/accounts/$name"/logs/$(date +%F).log 2>/dev/null || info "今日暂无日志"
+                else
+                    for d in "${MULTI_HOME}"/accounts/*/logs; do
+                        [ -d "$d" ] || continue
+                        echo "  --- ${d##*/accounts/}"
+                        ls -1t "$d"/*.log 2>/dev/null | head -2 | sed 's/^/    /'
+                    done
+                fi
+                ;;
+            0) return 0 ;;
+            11)
+                printf "要修改的账号名: "
+                read -r name || name=""
+                [ -n "$name" ] || { err "未输入账号名"; }
+                if [ -n "$name" ]; then
+                    printf "新的每日启动时间 (HH:MM，如 08:30): "
+                    read -r s || s=""
+                    if [ -z "$s" ]; then
+                        err "未输入时间"
+                    else
+                        DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" set-schedule "$name" "$s"
+                    fi
+                fi
+                ;;
+            *) err "无效选择" ;;
+        esac
+        echo ""
+        printf "按回车返回多账号菜单..."
+        read -r _pause || true
+    done
+}
+
 # ---------------- 4. 卸载 ----------------
 menu_uninstall() {
     echo ""
     echo "${CYAN}=== 卸载 ===${NC}"
-    printf "确定卸载 NeoHeberg AFK 吗？进程、凭证、依赖都将删除 [y/N]: "
+    printf "确定卸载 NeoHeberg AFK 吗？进程、凭证、依赖都将删除；多账号定时器会移除，多账号数据会单独询问 [y/N]: "
     local c
     read -r c || c=""
     case "$c" in
@@ -1047,9 +1284,28 @@ menu_uninstall() {
         schedule_remove >/dev/null 2>&1 || true
     fi
 
+    # 多账号：先移除每日定时器，再询问是否连同账号数据一起删
+    if [ -x "$MULTI_SCRIPT" ]; then
+        DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" stop >/dev/null 2>&1 || true
+        DAFAGUO_MULTI_HOME="$MULTI_HOME" bash "$MULTI_SCRIPT" remove-timers >/dev/null 2>&1 || true
+        ok "多账号定时器已移除"
+        if [ -d "$MULTI_HOME/accounts" ]; then
+            printf "是否同时删除多账号数据（账号凭证/浏览器profile/日志，$MULTI_HOME）？[y/N]: "
+            local md
+            read -r md || md=""
+            case "$md" in
+                y|Y|yes|YES)
+                    rm -rf "$MULTI_HOME"
+                    ok "多账号数据已删除"
+                    ;;
+                *) info "保留多账号数据于 $MULTI_HOME" ;;
+            esac
+        fi
+    fi
+
     rm -rf "$APP_DIR"
     ok "已删除 $APP_DIR（含 venv、凭证、日志）"
-    info "Firefox 运行时保留在 /root/.cache/ruyipage，如需彻底清理：rm -rf /root/.cache/ruyipage"
+    info "Playwright Chromium 运行时保留在 ~/.cache/ms-playwright，如需彻底清理：rm -rf ~/.cache/ms-playwright"
 }
 
 # ---------------- 更新主脚本（不动依赖） ----------------
@@ -1096,8 +1352,17 @@ menu_update() {
     adapt_script_for_old_python || true
     ok "主脚本已更新"
 
+    # 顺带更新多账号脚本（失败不影响主流程）
+    if curl -fsSL "$REPO_RAW/multi-account.sh" -o "$APP_DIR/multi-account.sh.new" 2>/dev/null; then
+        chmod +x "$APP_DIR/multi-account.sh.new"
+        mv -f "$APP_DIR/multi-account.sh.new" "$MULTI_SCRIPT"
+        ok "multi-account.sh 已更新"
+    else
+        warn "multi-account.sh 更新失败（保留旧版）"
+    fi
+
     # 若在运行中，询问是否重启
-    if pgrep -f "$SCRIPT" >/dev/null 2>&1; then
+    if pgrep -f "$RUN_PATTERN" >/dev/null 2>&1; then
         printf "脚本已更新，是否立即重启？[y/N]: "
         local rr
         read -r rr || rr=""
@@ -1130,7 +1395,9 @@ adapt_script_for_old_python_check() {
 menu() {
     while true; do
         local st
-        if pgrep -f "${SCRIPT}" >/dev/null 2>&1; then
+        # 用 $RUN_PATTERN 而非 $SCRIPT：start.sh 是相对路径启动，拿绝对路径去 pgrep
+        # 匹配不到，会误报「已安装未运行」。
+        if pgrep -f "$RUN_PATTERN" >/dev/null 2>&1; then
             st="${GREEN}运行中${NC}"
         elif [ -d "$APP_DIR" ]; then
             st="${YELLOW}已安装未运行${NC}"
@@ -1150,11 +1417,12 @@ menu() {
         echo -e " ${CYAN}[4]${NC} 查余额"
         echo -e " ${CYAN}[5]${NC} 每日定时挂机"
         echo -e " ${CYAN}[6]${NC} 运行状态"
-        echo -e " ${CYAN}[7]${NC} 更新主脚本"
-        echo -e " ${CYAN}[8]${NC} 卸载"
+        echo -e " ${CYAN}[7]${NC} 多账号管理"
+        echo -e " ${CYAN}[8]${NC} 更新主脚本"
+        echo -e " ${CYAN}[9]${NC} 卸载"
         echo -e " ${CYAN}[0]${NC} 退出脚本"
         echo -e "${GREEN}===============================================${NC}"
-        printf "请输入数字选择 [0-8]: "
+        printf "请输入数字选择 [0-9]: "
         local choice
         read -r choice || choice="0"
 
@@ -1165,8 +1433,9 @@ menu() {
             4) menu_balance ;;
             5) menu_schedule ;;
             6) menu_status ;;
-            7) menu_update ;;
-            8) menu_uninstall ;;
+            7) menu_multi ;;
+            8) menu_update ;;
+            9) menu_uninstall ;;
             0) echo "已退出"; exit 0 ;;
             *) err "无效选择"; sleep 1 ;;
         esac
@@ -1186,17 +1455,19 @@ case "${1:-}" in
     balance)   menu_balance ;;
     status)    menu_status ;;
     schedule)  menu_schedule ;;
+    multi)     menu_multi ;;
     update|up) menu_update ;;
     uninstall|remove|del) menu_uninstall ;;
     *)
         if [ -t 0 ]; then
             menu
         elif [ -r /dev/tty ]; then
-            # 管道方式（curl ... | bash）：交互从 /dev/tty 读取
+            # 管道方式（curl ... | bash）：stdin 是脚本内容，交互必须改从 /dev/tty 读，
+            # 否则 read 立刻拿到 EOF，菜单会一闪而过。
             exec < /dev/tty
             menu
         else
-            echo "非交互环境。可用: $0 [install|account|tg|balance|status|schedule|update|uninstall]"
+            echo "非交互环境。可用: $0 [install|account|tg|balance|status|schedule|multi|update|uninstall]"
             exit 1
         fi
         ;;

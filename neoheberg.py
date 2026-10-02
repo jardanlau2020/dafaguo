@@ -53,6 +53,38 @@ except Exception:
 
 STATE_FILE = os.path.join(WORK_DIR, "neoheberg_afk_state.json")
 
+# ── 站点计费周期（与 multi-account.sh 的 site_day() 必须同一套算法）────────────
+# 站点每日额度在北京时间 08:00 重置。08:00 之前触发时站点仍显示「昨天」的
+# 100/100；若直接拿北京日期做完成标记，会误判「今天已完成」并写死标记，
+# 结果当天剩余时间全部不挂机，而且状态一切正常、无人察觉。
+# multi-account.sh 读 DAFAGUO_SITE_RESET_HOUR，这里两个名字都认，避免两边跑偏。
+SITE_RESET_HOUR = int(os.environ.get("NH_SITE_RESET_HOUR")
+                      or os.environ.get("DAFAGUO_SITE_RESET_HOUR") or "8")
+
+
+def site_day() -> str:
+    """当前属于站点的哪个计费日（北京 08:00 为界），返回 YYYY-MM-DD。
+
+    ⚠️ 每次调用都要重算，不能在模块加载时算一次存起来：跨 08:00 运行的长任务
+    若沿用启动时的日期，写出的标记与看护端要查的名字会差一天 → 看护认不出
+    「正常收工」，每分钟重新拉起一次并重复推送 TG 战报。
+    """
+    bj = datetime.now(TZ_BJ)
+    if bj.hour < SITE_RESET_HOUR:
+        bj = bj - timedelta(days=1)
+    return bj.strftime("%Y-%m-%d")
+
+
+def done_marker() -> str:
+    """今日完成标记的路径。
+
+    用途：刷满 100 条后进程是**正常收工退出**，但 multi-account.sh 的每分钟看护
+    cron 只看 PID 存活，会把干净退出误判成「意外死亡」而反复拉起（上游 f0fb741
+    就是这个 bug）。写上这个标记后，启动时与看护端都会先查它。
+    """
+    return os.path.join(WORK_DIR, f"done-{site_day()}")
+
+
 TG_BOT_TOKEN  = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID    = os.environ.get("TG_CHAT_ID", "")
 
@@ -609,9 +641,19 @@ def run_browser_extractor(state: dict) -> requests.Session:
         sys.exit(1)
 
 def main() -> None:
+    # 今日已完成：直接退出，不登录、不重复推送 TG 战报。
+    # 看护 cron（multi-account.sh watch）也会查同一个标记，所以这里退出是「正常收工」。
+    # 刻意**不**删 STATE_FILE —— 里面存着 saved_cookies，删了下次要重跑浏览器登录。
+    _dm = done_marker()
+    if os.path.exists(_dm):
+        log.info("ℹ️ 今日 100 条广告已刷满（完成标记 %s 存在），跳过本次启动。",
+                 os.path.basename(_dm))
+        sys.exit(0)
+
     state = load_state()
-    # 单日轮次计数：仅在日期变化时清零；同一天内重启继续累加（rounds 仍为跨天累计值）
-    _today = datetime.now(TZ_BJ).strftime("%Y-%m-%d")
+    # 单日轮次计数：按**站点计费日**（北京 08:00 为界）清零，与完成标记同一套日界，
+    # 否则 00:00~08:00 之间重启会错误清零，TG 战报的「今日 N 轮」也会与站点对不上。
+    _today = site_day()
     if state.get("day_date") != _today:
         state["day_rounds"] = 0
         # 切日：记录当日起点余额，用于计算真正的当日收益（下方读到余额后回填）
@@ -694,6 +736,18 @@ def main() -> None:
                 msg = msg_dayend(bal_end, earned, state.get("day_rounds", 0))
                 log.info(msg.replace("\n", " | "))
                 send_tg(msg)
+                # 写完成标记：告知看护 cron「这是正常收工，别再拉起」。
+                # 名字用写入时刻的 site_day()，与看护端查询时用的一致。
+                try:
+                    _dm = done_marker()
+                    with open(_dm, "w") as f:
+                        f.write(f"{datetime.now(TZ_BJ).strftime('%Y-%m-%d %H:%M:%S')} 北京  "
+                                f"余额 {bal_end if bal_end is not None else 'N/A'}  "
+                                f"今日 {state.get('day_rounds', 0)} 轮\n")
+                    os.chmod(_dm, 0o600)
+                    log.info("📌 已写完成标记 %s（看护 cron 不会再拉起）", os.path.basename(_dm))
+                except Exception as e:
+                    log.warning("⚠️ 写完成标记失败（看护可能重复拉起）: %s", e)
                 sys.exit(0)
                 
             # 【终极优化】：遇到拦截（冷却中或缺货），完全不打红字，在后台默默等待 20 秒
