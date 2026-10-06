@@ -162,10 +162,62 @@ jobs:
                           href: e.getAttribute && e.getAttribute('href') || ''}))""")
                   for e in els:
                       print(f"[cgu] 元素: {e}")
+
+                  # ── 第四段（2026-10-06 用戶授權方案 A）：接受 Privacy Policy 2026-10-05 版 ──
+                  # 只會喺「待接受文案 + J'accepte 按鈕」同時存在時先點；已接受就只報狀態唔點。
+                  btn = pg.locator("button[type=submit]")
+                  has_pending = ("j'accepte" in txt.lower() and "déjà accepté" not in txt.lower())
+                  print(f"[accept] 待接受={has_pending} submit掣數={btn.count()}")
+                  if has_pending and btn.count() > 0:
+                      print(f"[accept] 撳掣前: {txt[:260]}")
+                      btn.first.click()
+                      pg.wait_for_timeout(7000)
+                      txt2 = " ".join(pg.inner_text("body").split())
+                      print(f"[accept] 撳掣後 url={pg.url} innerText={txt2[:320]}")
+                  else:
+                      print(f"[accept] 冇觸發點擊（已接受／冇掣）: {txt[:260]}")
+
+                  # 落新 cookie（接受動作可能輪換 session）
+                  fresh2 = {c["name"]: c["value"] for c in ctx.cookies()}
+                  print(f"[accept] cookie 變動: {'有' if fresh2 != cookies else '無'}"
+                        f"（{len(fresh2)} 個）")
+
+                  # 驗證 1（瀏覽器）：直開 /shop/ads 應再唔會被弹去 /account/cgu
+                  pg.goto(nh.ADS_URL, wait_until="domcontentloaded", timeout=45000)
+                  pg.wait_for_timeout(5000)
+                  ptxt = " ".join(pg.inner_text("body").split())
+                  bm = re.search(r"(?:Solde|Balance)\s*[\d,\.]+\s*coins", ptxt, re.I)
+                  print(f"[accept] 驗證1 瀏览器 GET /shop/ads -> url={pg.url}")
+                  print(f"[accept] 驗證1 餘額字樣 -> {bm.group(0)!r}" if bm
+                        else f"[accept] 驗證1 餘額字樣 MISS｜頁頭240: {ptxt[:240]}")
                   browser.close()
           except Exception as e:
               print(f"[cgu] 瀏覽器 dump 失敗: {type(e).__name__}: {e}")
+              fresh2 = locals().get("fresh2", cookies)
+
+          try:
+              # 驗證 2（curl_cffi Session——主循環真身）：/shop/ads 直達 + 餘額 regex
+              state2 = {"saved_cookies": fresh2}
+              s2 = nh.make_session(state2)
+              r4 = s2.get(nh.ADS_URL, timeout=20)
+              print(f"[accept] 驗證2 Session GET -> {r4.status_code} final={r4.url}")
+              c2 = re.sub(r"<[^>]+>", " ", r4.text)
+              bm2 = re.search(r"(?:Solde|Balance)\s*[\d,\.]+\s*coins", c2, re.I) or \
+                    re.search(r"[\d,\.]+\s*coins", c2, re.I)
+              print(f"[accept] 驗證2 餘額 -> {bm2.group(0)!r}" if bm2
+                    else "[accept] 驗證2 餘額 MISS")
+              # 驗證 3：gen_callback 應回真實 callback URL（唔再係 None/WAIT）
+              cm2 = re.search(r"name=[\"'](csrf_token|_token)[\"']\s+value=[\"']([a-fA-F0-9]+)[\"']", r4.text)
+              if cm2:
+                  cb2 = nh.gen_callback(s2, cm2.group(1), cm2.group(2))
+                  print(f"[accept] 驗證3 gen_callback -> {cb2!r}"
+                        + ("   ← 仲係 None/WAIT，主循環會繼續靜默" if not cb2 or cb2 == "WAIT" else "   ← 主循環返生"))
+              else:
+                  print("[accept] 驗證3 csrf 未搵到")
+          except Exception as e:
+              print(f"[accept] 驗證2/3 異常: {type(e).__name__}: {e}")
           PY
+
 
 
 
