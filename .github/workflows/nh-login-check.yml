@@ -130,6 +130,42 @@ jobs:
           # 驗證：直接請求 CGU 頁本身
           r3 = s.get(f"{nh.BASE}/account/cgu", timeout=20)
           print(f"[probe] GET /account/cgu -> {r3.status_code} final={r3.url} bytes={len(r3.text)}")
+
+          # ── 真瀏覽器渲染 CGU 頁（只讀：不點任何嘢，只 dump 可見內容+可互動元素） ──
+          try:
+              from playwright.sync_api import sync_playwright
+              with sync_playwright() as pw:
+                  lk = {}
+                  if os.environ.get("PROXY"):
+                      lk["proxy"] = {"server": os.environ["PROXY"]}
+                  browser = pw.chromium.launch(**lk)
+                  ctx = browser.new_context(
+                      user_agent=nh.UA_CHROME,
+                      viewport={"width": 1366, "height": 900},
+                      locale="fr-FR", timezone_id="Europe/Paris")
+                  ctx.add_cookies([
+                      {"name": k, "value": v, "url": nh.BASE + "/"}
+                      for k, v in cookies.items()
+                  ])
+                  pg = ctx.new_page()
+                  pg.goto(f"{nh.BASE}/account/cgu", wait_until="domcontentloaded", timeout=45000)
+                  pg.wait_for_timeout(5000)
+                  print(f"[cgu] url={pg.url}")
+                  print(f"[cgu] title={pg.title()}")
+                  txt = " ".join(pg.inner_text("body").split())
+                  print(f"[cgu] innerText({len(txt)}字): {txt[:1800]}")
+                  els = pg.eval_on_selector_all(
+                      "button, a, input[type=submit], input[type=checkbox], [role=button]",
+                      """els => els.map(e => ({tag: e.tagName, type: e.type || '',
+                          txt: (e.innerText || e.value || e.getAttribute('aria-label') || '').trim().slice(0,90),
+                          id: e.id || '', cls: (e.className || '').toString().slice(0,70),
+                          href: e.getAttribute && e.getAttribute('href') || ''}))""")
+                  for e in els:
+                      print(f"[cgu] 元素: {e}")
+                  browser.close()
+          except Exception as e:
+              print(f"[cgu] 瀏覽器 dump 失敗: {type(e).__name__}: {e}")
           PY
+
 
 
