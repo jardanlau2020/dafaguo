@@ -165,9 +165,13 @@ jobs:
 
                   # ── 第四段（2026-10-06 用戶授權方案 A）：接受 Privacy Policy 2026-10-05 版 ──
                   # 只會喺「待接受文案 + J'accepte 按鈕」同時存在時先點；已接受就只報狀態唔點。
+                  # 判據修正：頁面永遠同時有「déjà accepté…conditions」（CGU 已簽）同
+                  # 「J'accepte …Privacy Policy」（待簽）兩句 → 唔可以拿文案判，
+                  # 要睇 submit 按鈕文字本身：按鈕寫住 J'accepte = 有待接受嘢。
                   btn = pg.locator("button[type=submit]")
-                  has_pending = ("j'accepte" in txt.lower() and "déjà accepté" not in txt.lower())
-                  print(f"[accept] 待接受={has_pending} submit掣數={btn.count()}")
+                  btn_txt = btn.first.inner_text().strip() if btn.count() else ""
+                  has_pending = "accepte" in btn_txt.lower()
+                  print(f"[accept] 待接受={has_pending} 按鈕={btn_txt[:80]!r} submit掣數={btn.count()}")
                   if has_pending and btn.count() > 0:
                       print(f"[accept] 撳掣前: {txt[:260]}")
                       btn.first.click()
