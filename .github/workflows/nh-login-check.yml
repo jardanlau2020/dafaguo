@@ -1,6 +1,7 @@
 name: NH Login Check
 
-# 診斷用：只用真瀏覽器登入一次（過 CF + 點 Cap 驗證碼），打印結果就收工。
+# 診斷用：真瀏覽器登入一次（過 CF + 點 Cap 驗證碼），再用新鮮 cookie 打一次面板
+# （dump 餘額 regex / csrf / CF 標頭 / gen_callback 首步），打印結果就收工。
 # 唔會跑 AFK 迴圈、唔會發 TG。手動 workflow_dispatch 觸發。
 
 on:
@@ -64,4 +65,48 @@ jobs:
               print("❌ 登入失敗")
               sys.exit(1)
           print("✅ 登入成功——Cap 驗證碼關卡已通過")
+
+          # ── 餘額/面板診斷（2026-10-06 新增） ─────────────────────────
+          # 背景：當日 AFK run 37432496406 用新鮮 cookie 驗餘額 5 連敗
+          # （200 但頁面冇「X coins」），主循環 5h48m 零日誌收場。
+          # 呢段模擬主循環同一條 curl_cffi Session 路徑，逐項 dump：
+          #   ① HTTP 狀態/最終 URL/CF 標頭/頁 title（邊種回應？）
+          #   ② 三條餘額 regex 實測（markup 改咗？）
+          #   ③ csrf regex（主循環第一步要靠佢）
+          #   ④ gen_callback 首步結果（"WAIT" = 主循環零日誌空轉嘅直接證據）
+          import re
+          state = {"saved_cookies": cookies}
+          s = nh.make_session(state)
+          r = s.get(nh.ADS_URL, timeout=20)
+          print(f"[probe] GET {nh.ADS_URL} -> {r.status_code} final={r.url} bytes={len(r.text)}")
+          print(f"[probe] cf-ray={r.headers.get('cf-ray')} server={r.headers.get('server')} "
+                f"cf-mitigated={r.headers.get('cf-mitigated')} content-type={r.headers.get('content-type')}")
+          tm = re.search(r"<title>(.*?)</title>", r.text, re.I | re.S)
+          print(f"[probe] title={tm.group(1).strip()[:100] if tm else None}")
+          clean = re.sub(r"<[^>]+>", " ", r.text)
+          for pat in (r"Solde\s*[\d,\.]+\s*coins", r"Balance\s*[\d,\.]+\s*coins", r"[\d,\.]+\s*coins"):
+              mm = re.search(pat, clean, re.I)
+              print(f"[probe] regex {pat!r} -> {mm.group(0)!r}" if mm else f"[probe] regex {pat!r} -> MISS")
+          cm = re.search(r"name=[\"'](csrf_token|_token)[\"']\s+value=[\"']([a-fA-F0-9]+)[\"']", r.text)
+          print(f"[probe] csrf -> {cm.group(1) if cm else 'NOT FOUND'}")
+          print(f"[probe] login跳轉={'/login' in r.url} Connexion字樣={'Connexion' in r.text[:600]}")
+          vis = re.sub(r"\s+", " ", clean).strip()
+          print(f"[probe] 可見文字前400: {vis[:400]}")
+          sm = re.search(r"solde", vis, re.I)
+          if sm:
+              i = sm.start()
+              print(f"[probe] 'solde' 前後: …{vis[max(0,i-60):i+120]}…")
+          print(f"[probe] UA={str(s.headers.get('User-Agent'))[:75]}")
+          print(f"[probe] PROXY={os.environ.get('PROXY') or '(direct)'}")
+          print(f"[probe] cookie已載: {sorted(cookies)}")
+          if cm:
+              try:
+                  cb = nh.gen_callback(s, cm.group(1), cm.group(2))
+                  print(f"[probe] gen_callback 首步 -> {cb!r}"
+                        + ("   ← 主循環會 sleep(20) 靜默空轉，零日誌" if cb == "WAIT" else ""))
+              except Exception as e:
+                  print(f"[probe] gen_callback 拋錯 -> {type(e).__name__}: {e}  ← 主循環會 sleep(30) 靜默")
+          else:
+              print("[probe] 無 csrf，跳過 gen_callback（主循環每輪會喺度靜默 except）")
           PY
+
