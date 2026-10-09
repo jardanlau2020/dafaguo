@@ -47,7 +47,7 @@ BASE_WORK_DIR = os.environ.get("BROWSER_WORK_DIR", "/home/browser/browser-work")
 WORK_DIR = os.path.join(BASE_WORK_DIR, "profiles")
 os.makedirs(WORK_DIR, exist_ok=True)
 try:
-    os.chmod(WORK_DIR, 0o777)
+    os.chmod(WORK_DIR, 0o755)
 except Exception:
     pass
 
@@ -116,7 +116,7 @@ def send_tg(text: str) -> None:
                                       data=data, headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=15)
     except Exception as e:
-        pass
+        log.warning("TG 通知失败: %s", e)
 
 
 def now_local() -> str:
@@ -169,7 +169,7 @@ def save_state(state: dict) -> None:
     try:
         with open(STATE_FILE, "w") as f:
             json.dump(state, f)
-        os.chmod(STATE_FILE, 0o666)
+        os.chmod(STATE_FILE, 0o644)
     except Exception:
         pass
 
@@ -537,7 +537,8 @@ def gen_callback(s: requests.Session, csrf_name: str, csrf_val: str) -> Optional
         if limit_m and limit_m.group(1) == limit_m.group(2):
             return "LIMIT_REACHED"
             
-        # 【强迫症修改】：完全屏蔽错误提示，遇到拦截静默返回 "WAIT"
+        # 无重定向且非满额：记录诊断信息后返回 WAIT
+        log.debug("gen_callback: 无重定向, HTTP %d, body[:200]=%s", r.status_code, clean_text[:200])
         return "WAIT"
         
     m = re.search(r"url=([^&]+)", loc)
