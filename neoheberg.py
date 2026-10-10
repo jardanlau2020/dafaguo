@@ -321,6 +321,33 @@ class NeohebergLoginBot:
         return bool(self._cap_token(pg))
 
     # ---------------------------- 主流程 ----------------------------
+    @staticmethod
+    def _accept_privacy_gate(pg, settle_ms: int = 7000) -> bool:
+        """被 Privacy Policy/CGU 同意牆攔住就撳「J'accepte」，回傳有冇撳過。
+
+        判據：只認 **submit 掣嘅文字**含「accepte」。頁面永遠同時有
+        「déjà accepté…」（已簽）同「J'accepte…」（待簽）兩句，拿文案判會誤判。
+        """
+        try:
+            blocked = _is_privacy_gate(pg.url, "")
+            btn = pg.locator("button[type=submit]")
+            n = btn.count()
+            btn_txt = btn.first.inner_text().strip() if n else ""
+            pending = "accepte" in btn_txt.lower()
+            if not (blocked or pending):
+                return False
+            if not (pending and n):
+                log.warning("⚠️ 疑似 CGU 牆（url=%s）但搵唔到可撳嘅 J'accepte 掣", pg.url)
+                return False
+            log.info("📋 偵測到 Privacy Policy/CGU 同意牆，撳「%s」…", btn_txt[:60])
+            btn.first.click()
+            pg.wait_for_timeout(settle_ms)
+            log.info("✅ 已撳同意掣 → url=%s", pg.url)
+            return True
+        except Exception as e:
+            log.warning("⚠️ 處理 CGU 同意牆時異常(%s): %s", type(e).__name__, e)
+            return False
+
     def run(self) -> dict:
         if not self.email or not self.password:
             log.error("❌ 浏览器获取 Cookie 失败：未配置 EMAIL 或 PASSWORD 环境变量！")
@@ -456,6 +483,11 @@ class NeohebergLoginBot:
             pg.goto(ADS_URL, wait_until="domcontentloaded", timeout=60000)
             pg.wait_for_timeout(4000)
             self._wait_past_cf(pg)
+            # Privacy Policy/CGU 同意牆（2026-10-05 站方更新）：唔撳就永遠入唔到
+            # 廣告場 → 餘額讀 0、掛機零產出（10-05 空轉 5h48m 嘅真因）。
+            # 移植自上游 xxbb678/dafaguo 10-06 嘅 accept_privacy_gate()，
+            # 判據同我哋 nh-login-check 第四段一致（認 submit 掣文字，唔認文案）。
+            self._accept_privacy_gate(pg)
             if "/login" in pg.url:
                 log.error("❌ 登录失败：访问广告后台被弹回登录页。")
                 return {}
@@ -484,6 +516,31 @@ class NeohebergLoginBot:
                 pass# ════════════════════════════════════════════════════════════════════
 # 底层 HTTP 极速挂机逻辑
 # ════════════════════════════════════════════════════════════════════
+class PrivacyGateRequired(RuntimeError):
+    """站方 Privacy Policy / CGU 同意牆攔住（NeoHeberg 2026-10-05 起新增）。
+
+    已登入帳號會被 302 去 `/account/cgu?next=/shop/ads`，頁面冇「Solde … coins」
+    字樣。**唔可以當「餘額 0」** —— 上游 xxbb678/dafaguo 2026-10-06 同款教訓：
+    當成 0 就會令 start_balance 記錯，之後成日收益統計全歪（實證：空轉 5h48m、
+    run 零產出）。正確做法＝拋呢個專用例外，交由瀏覽器路徑撳一次「J'accepte」。
+
+    判據刻意唔靠文案：頁面**永遠同時**有「déjà accepté …conditions」（已簽）同
+    「J'accepte … Privacy Policy」（待簽）兩句，所以只認 URL 同 submit 掣文字。
+    """
+
+
+_GATE_URL_RE = re.compile(r"/account/cgu|/cgu\?", re.I)
+_GATE_BTN_RE = re.compile(
+    r'<button[^>]*type=["\']submit["\'][^>]*>[^<]{0,80}?accepte', re.I | re.S)
+
+
+def _is_privacy_gate(url: str, html: str) -> bool:
+    """呢一頁係唔係 Privacy Policy/CGU 同意牆？（純函數，方便單測）"""
+    if url and _GATE_URL_RE.search(url):
+        return True
+    return bool(html and _GATE_BTN_RE.search(html))
+
+
 def _get_balance(s: requests.Session) -> float:
     last_err = None
     for attempt in range(5):
@@ -499,6 +556,12 @@ def _get_balance(s: requests.Session) -> float:
             if "/login" in r.url or "Connexion" in r.text[:600].replace(" ", ""):
                 raise PermissionError("session 过期")
 
+            # Privacy Policy/CGU 同意牆：一定要同「讀唔到餘額」分開，
+            # 唔可以當 0（否則 start_balance 記錯，成日統計全歪）。
+            if _is_privacy_gate(r.url, r.text):
+                raise PrivacyGateRequired(
+                    f"被 Privacy Policy/CGU 同意牆攔住（url={r.url}）")
+
             clean_text = re.sub(r'<[^>]+>', ' ', r.text)
             m = re.search(r'Solde\s*([\d,\.]+)\s*coins', clean_text, re.IGNORECASE)
             if not m: m = re.search(r'Balance\s*([\d,\.]+)\s*coins', clean_text, re.IGNORECASE)
@@ -508,7 +571,7 @@ def _get_balance(s: requests.Session) -> float:
             last_err = RuntimeError("页面中未找到余额")
             log.warning("⚠️ 未匹配到余额字样，第 %d/5 次重试...", attempt + 1)
             time.sleep(5)
-        except PermissionError:
+        except (PermissionError, PrivacyGateRequired):
             raise
         except Exception as e:
             last_err = e
@@ -678,6 +741,9 @@ def main() -> None:
         ok = True
     except PermissionError:
         log.warning("⚠️ 初次检测：发现未配置 Cookie 或缓存已作废！")
+    except PrivacyGateRequired as e:
+        # 唔係 cookie 壞，係站方要撳一次同意掣 → 交畀下面瀏覽器路徑處理
+        log.warning("📋 初次检测：%s → 改用瀏覽器撳同意掣", e)
     except Exception as e:
         # 网络/CF 瞬时抖动：不要瞬退，重试两轮后再决定
         log.warning("⚠️ 启动余额检测失败(%s): %s，稍后重试...", type(e).__name__, e)
@@ -693,7 +759,7 @@ def main() -> None:
                 report(state, bal, force=True)
                 ok = True
                 break
-            except PermissionError:
+            except (PermissionError, PrivacyGateRequired):
                 break
             except Exception as e2:
                 log.warning("重试仍失败(%s): %s", type(e2).__name__, e2)
