@@ -414,9 +414,33 @@ class NeohebergLoginBot:
             pg.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
             self._wait_past_cf(pg)
 
-            ident = pg.query_selector("input#identifier")
+            # 2026-10-10 修：原本「query_selector 搵唔到 input#identifier 就當已登入」太樂觀。
+            # SPA 未 render 完、或者仲卡喺 CF/Cap 關卡時都會搵唔到 → 結果**從來冇填過帳密**
+            # 就直去後台，被彈返 /login 收場（實證 run 38034799493：15:52:13「未見到登录框」
+            # → 15:52:17「❌ 登录失败：访问广告后台被弹回登录页」，而 log 全程冇「输入账号」）。
+            # 新邏輯：先輪詢等表單（3 次 × 10s，中間過一次 CF/Cap）；真係冇表單時，
+            # **只有唔喺 /login 先當已登入**，仍然喺 /login 就明確報失敗，唔好靜默當成功。
+            ident = None
+            for _try in range(3):
+                try:
+                    ident = pg.wait_for_selector("input#identifier", timeout=10000)
+                except Exception:
+                    ident = None
+                if ident is not None:
+                    break
+                log.info("⏳ 未見 login 表單（第 %d/3 次），可能仲喺 CF/Cap 關卡，等一等…", _try + 1)
+                self._wait_past_cf(pg, timeout=15)
+                time.sleep(2)
+
             if ident is None:
-                log.info("✅ 未見到登录框（可能已是登录态），直接去后台验证…")
+                if "/login" in (pg.url or ""):
+                    log.error("❌ 等咗 30 秒都冇 login 表單（url=%s）→ 唔敢當已登入，報失敗", pg.url)
+                    try:
+                        pg.screenshot(path="login_form_missing.png")
+                    except Exception:
+                        pass
+                    return {}
+                log.info("✅ /login 冇表單但已唔喺 /login（url=%s）→ 當已登入，去後台驗證…", pg.url)
             else:
                 log.info("✍️ [1/2] 输入账号…")
                 pg.fill("input#identifier", self.email)
